@@ -33,7 +33,7 @@
 
 #include "IDrmManagerService.h"
 
-#define INVALID_BUFFER_LENGTH -1
+#define INVALID_BUFFER_LENGTH (-1)
 #define MAX_BINDER_TRANSACTION_SIZE ((1*1024*1024)-(4096*2))
 
 using namespace android;
@@ -303,7 +303,9 @@ DrmInfo* BpDrmManagerService::acquireDrmInfo(int uniqueId, const DrmInfoRequest*
         const String8 value = drmInforequest->get(key);
         if (key == String8("FileDescriptorKey")) {
             int fd = -1;
-            sscanf(value.string(), "FileDescriptor[%d]", &fd);
+            if (sscanf(value.string(), "FileDescriptor[%d]", &fd) != 1) {
+                sscanf(value.string(), "%d", &fd);
+            }
             data.writeFileDescriptor(fd);
         } else {
             data.writeString8((value == String8("")) ? String8("NULL") : value);

@@ -18,7 +18,7 @@
 
 #define SOFT_MP3_H_
 
-#include "SimpleSoftOMXComponent.h"
+#include <media/stagefright/omx/SimpleSoftOMXComponent.h>
 
 struct tPVMP3DecoderExternal;
 
@@ -72,6 +72,7 @@ private:
 
     void initPorts();
     void initDecoder();
+    void *memsetSafe(OMX_BUFFERHEADERTYPE *outHeader, int c, size_t len);
 
     DISALLOW_EVIL_CONSTRUCTORS(SoftMP3);
 };

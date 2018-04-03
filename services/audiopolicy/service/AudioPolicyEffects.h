@@ -23,11 +23,12 @@
 #include <cutils/misc.h>
 #include <media/AudioEffect.h>
 #include <system/audio.h>
-#include <hardware/audio_effect.h>
 #include <utils/Vector.h>
 #include <utils/SortedVector.h>
 
 namespace android {
+
+class AudioPolicyService;
 
 // ----------------------------------------------------------------------------
 
@@ -42,7 +43,7 @@ public:
     // The constructor will parse audio_effects.conf
     // First it will look whether vendor specific file exists,
     // otherwise it will parse the system default file.
-	         AudioPolicyEffects();
+            AudioPolicyEffects(AudioPolicyService *audioPolicyService);
     virtual ~AudioPolicyEffects();
 
     // NOTE: methods on AudioPolicyEffects should never be called with the AudioPolicyService
@@ -51,7 +52,7 @@ public:
 
     // Return a list of effect descriptors for default input effects
     // associated with audioSession
-    status_t queryDefaultInputEffects(int audioSession,
+    status_t queryDefaultInputEffects(audio_session_t audioSession,
                              effect_descriptor_t *descriptors,
                              uint32_t *count);
 
@@ -59,15 +60,16 @@ public:
     // Effects are attached depending on the audio_source_t
     status_t addInputEffects(audio_io_handle_t input,
                              audio_source_t inputSource,
-                             int audioSession);
+                             audio_session_t audioSession);
 
     // Add all input effects associated to this input
-    status_t releaseInputEffects(audio_io_handle_t input);
+    status_t releaseInputEffects(audio_io_handle_t input,
+                                 audio_session_t audioSession);
 
 
     // Return a list of effect descriptors for default output effects
     // associated with audioSession
-    status_t queryDefaultOutputSessionEffects(int audioSession,
+    status_t queryDefaultOutputSessionEffects(audio_session_t audioSession,
                              effect_descriptor_t *descriptors,
                              uint32_t *count);
 
@@ -75,12 +77,25 @@ public:
     // Effects are attached depending on the audio_stream_type_t
     status_t addOutputSessionEffects(audio_io_handle_t output,
                              audio_stream_type_t stream,
-                             int audioSession);
+                             audio_session_t audioSession);
 
     // release all output effects associated with this output stream and audiosession
     status_t releaseOutputSessionEffects(audio_io_handle_t output,
                              audio_stream_type_t stream,
-                             int audioSession);
+                             audio_session_t audioSession);
+
+    status_t updateOutputAudioSessionInfo(audio_io_handle_t output,
+                             audio_stream_type_t stream,
+                             audio_session_t audioSession,
+                             audio_output_flags_t flags,
+                             const audio_config_t *config, uid_t uid);
+
+    status_t releaseOutputAudioSessionInfo(audio_io_handle_t output,
+                             audio_stream_type_t stream,
+                             audio_session_t audioSession);
+
+    status_t listAudioSessions(audio_stream_type_t streams,
+                             Vector< sp<AudioSessionInfo>> &sessions);
 
 private:
 
@@ -135,13 +150,13 @@ private:
     // class to store voctor of AudioEffects
     class EffectVector {
     public:
-        EffectVector(int session) : mSessionId(session), mRefCount(0) {}
+        explicit EffectVector(audio_session_t session) : mSessionId(session), mRefCount(0) {}
         /*virtual*/ ~EffectVector() {}
 
         // Enable or disable all effects in effect vector
         void setProcessorEnabled(bool enabled);
 
-        const int mSessionId;
+        const audio_session_t mSessionId;
         // AudioPolicyManager keeps mLock, no need for lock on reference count here
         int mRefCount;
         Vector< sp<AudioEffect> >mEffects;
@@ -155,7 +170,8 @@ private:
     audio_stream_type_t streamNameToEnum(const char *name);
 
     // Parse audio_effects.conf
-    status_t loadAudioEffectConfig(const char *path);
+    status_t loadAudioEffectConfig(const char *path); // TODO: add legacy in the name
+    status_t loadAudioEffectXmlConfig(); // TODO: remove "Xml" in the name
 
     // Load all effects descriptors in configuration file
     status_t loadEffects(cnode *root, Vector <EffectDesc *>& effects);
@@ -170,25 +186,29 @@ private:
     void loadEffectParameters(cnode *root, Vector <effect_param_t *>& params);
     effect_param_t *loadEffectParameter(cnode *root);
     size_t readParamValue(cnode *node,
-                          char *param,
+                          char **param,
                           size_t *curSize,
                           size_t *totSize);
-    size_t growParamSize(char *param,
+    size_t growParamSize(char **param,
                          size_t size,
                          size_t *curSize,
                          size_t *totSize);
 
-    // protects access to mInputSources, mInputs, mOutputStreams, mOutputSessions
+    // protects access to mInputSources, mInputSessions, mOutputStreams, mOutputSessions
     Mutex mLock;
     // Automatic input effects are configured per audio_source_t
     KeyedVector< audio_source_t, EffectDescVector* > mInputSources;
     // Automatic input effects are unique for audio_io_handle_t
-    KeyedVector< audio_io_handle_t, EffectVector* > mInputs;
+    KeyedVector< audio_session_t, EffectVector* > mInputSessions;
 
     // Automatic output effects are organized per audio_stream_type_t
     KeyedVector< audio_stream_type_t, EffectDescVector* > mOutputStreams;
     // Automatic output effects are unique for audiosession ID
-    KeyedVector< int32_t, EffectVector* > mOutputSessions;
+    KeyedVector< audio_session_t, EffectVector* > mOutputSessions;
+    // Stream info for session events
+    KeyedVector< audio_session_t, sp<AudioSessionInfo> > mOutputAudioSessionInfo;
+
+    AudioPolicyService *mAudioPolicyService;
 };
 
 }; // namespace android

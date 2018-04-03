@@ -31,9 +31,9 @@ namespace camera3 {
 
 Camera3IOStreamBase::Camera3IOStreamBase(int id, camera3_stream_type_t type,
         uint32_t width, uint32_t height, size_t maxSize, int format,
-        android_dataspace dataSpace, camera3_stream_rotation_t rotation) :
+        android_dataspace dataSpace, camera3_stream_rotation_t rotation, int setId) :
         Camera3Stream(id, type,
-                width, height, maxSize, format, dataSpace, rotation),
+                width, height, maxSize, format, dataSpace, rotation, setId),
         mTotalBufferCount(0),
         mHandoutTotalBufferCount(0),
         mHandoutOutputBufferCount(0),
@@ -42,7 +42,8 @@ Camera3IOStreamBase::Camera3IOStreamBase(int id, camera3_stream_type_t type,
 
     mCombinedFence = new Fence();
 
-    if (maxSize > 0 && format != HAL_PIXEL_FORMAT_BLOB) {
+    if (maxSize > 0 &&
+            (format != HAL_PIXEL_FORMAT_BLOB && format != HAL_PIXEL_FORMAT_RAW_OPAQUE)) {
         ALOGE("%s: Bad format for size-only stream: %d", __FUNCTION__,
                 format);
         mState = STATE_ERROR;
@@ -68,7 +69,7 @@ void Camera3IOStreamBase::dump(int fd, const Vector<String16> &args) const {
     (void) args;
     String8 lines;
 
-    uint32_t consumerUsage = 0;
+    uint64_t consumerUsage = 0;
     status_t res = getEndpointUsage(&consumerUsage);
     if (res != OK) consumerUsage = 0;
 
@@ -77,13 +78,15 @@ void Camera3IOStreamBase::dump(int fd, const Vector<String16> &args) const {
             camera3_stream::width, camera3_stream::height,
             camera3_stream::format, camera3_stream::data_space);
     lines.appendFormat("      Max size: %zu\n", mMaxSize);
-    lines.appendFormat("      Combined usage: %d, max HAL buffers: %d\n",
-            camera3_stream::usage | consumerUsage, camera3_stream::max_buffers);
+    lines.appendFormat("      Combined usage: %" PRIu64 ", max HAL buffers: %d\n",
+            mUsage | consumerUsage, camera3_stream::max_buffers);
     lines.appendFormat("      Frames produced: %d, last timestamp: %" PRId64 " ns\n",
             mFrameCount, mLastTimestamp);
     lines.appendFormat("      Total buffers: %zu, currently dequeued: %zu\n",
             mTotalBufferCount, mHandoutTotalBufferCount);
     write(fd, lines.string(), lines.size());
+
+    Camera3Stream::dump(fd, args);
 }
 
 status_t Camera3IOStreamBase::configureQueueLocked() {
@@ -123,6 +126,7 @@ status_t Camera3IOStreamBase::disconnectLocked() {
     switch (mState) {
         case STATE_IN_RECONFIG:
         case STATE_CONFIGURED:
+        case STATE_ABANDONED:
             // OK
             break;
         default:

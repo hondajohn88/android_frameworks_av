@@ -21,6 +21,7 @@
 
 #include      <stdio.h>
 #include      <stdlib.h>
+#include      <string.h>
 #include      <time.h>
 #include      "voAMRWB.h"
 #include      "cmnMemory.h"
@@ -89,7 +90,7 @@ int encode(
 	VO_AUDIO_CODECAPI       AudioAPI;
 	VO_MEM_OPERATOR         moper;
 	VO_CODEC_INIT_USERDATA  useData;
-	VO_HANDLE               hCodec;
+	VO_HANDLE               hCodec = NULL;
 	VO_CODECBUFFER          inData;
 	VO_CODECBUFFER          outData;
 	VO_AUDIO_OUTPUTINFO     outFormat;
@@ -210,7 +211,7 @@ int encode(
 			if(returnCode == 0)
 			{
 				framenum++;
-				printf(" Frames processed: %hd\r", framenum);
+				printf(" Frames processed: %d\r", framenum);
 				if(framenum == 1)
 				{
 					fwrite(OutputBuf, 1, outData.Length + size1, fdst);
@@ -222,12 +223,12 @@ int encode(
 					fflush(fdst);
 				}
 			}
-			else if(returnCode == VO_ERR_LICENSE_ERROR)
+			else if((unsigned)returnCode == VO_ERR_LICENSE_ERROR)
 			{
 		        printf("Encoder time reach upper limit......");
 		        goto safe_exit;
 			}
-		} while(returnCode != VO_ERR_INPUT_BUFFER_SMALL);
+		} while((unsigned)returnCode != VO_ERR_INPUT_BUFFER_SMALL);
 
 		finish = clock();
 		duration += finish - start;

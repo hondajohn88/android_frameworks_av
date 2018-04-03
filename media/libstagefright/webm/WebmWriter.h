@@ -36,11 +36,11 @@ namespace android {
 
 class WebmWriter : public MediaWriter {
 public:
-    WebmWriter(int fd);
+    explicit WebmWriter(int fd);
     ~WebmWriter() { reset(); }
 
 
-    virtual status_t addSource(const sp<MediaSource> &source);
+    virtual status_t addSource(const sp<IMediaSource> &source);
     virtual status_t start(MetaData *param = NULL);
     virtual status_t stop();
     virtual status_t pause();
@@ -85,7 +85,7 @@ private:
         const char *mName;
         sp<WebmElement> (*mMakeTrack)(const sp<MetaData>&);
 
-        sp<MediaSource> mSource;
+        sp<IMediaSource> mSource;
         sp<WebmElement> mTrackEntry;
         sp<WebmFrameSourceThread> mThread;
         LinkedBlockingQueue<const sp<WebmFrame> > mSink;
@@ -110,6 +110,7 @@ private:
         }
     };
     WebmStream mStreams[kMaxStreams];
+    Vector<sp<WebmElement>> mStreamsInOrder;
 
     sp<WebmFrameSinkThread> mSinkThread;
 

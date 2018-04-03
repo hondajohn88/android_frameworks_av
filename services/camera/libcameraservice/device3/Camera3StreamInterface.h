@@ -19,12 +19,27 @@
 
 #include <utils/RefBase.h>
 #include "Camera3StreamBufferListener.h"
+#include "Camera3StreamBufferFreedListener.h"
 
 struct camera3_stream_buffer;
 
 namespace android {
 
 namespace camera3 {
+
+enum {
+    /**
+     * This stream set ID indicates that the set ID is invalid, and this stream doesn't intend to
+     * share buffers with any other stream. It is illegal to register this kind of stream to
+     * Camera3BufferManager.
+     */
+    CAMERA3_STREAM_SET_ID_INVALID = -1,
+
+    /**
+     * Invalid output stream ID.
+     */
+    CAMERA3_STREAM_ID_INVALID = -1,
+};
 
 class StatusTracker;
 
@@ -45,12 +60,28 @@ class Camera3StreamInterface : public virtual RefBase {
     virtual int      getId() const = 0;
 
     /**
+     * Get the output stream set id.
+     */
+    virtual int      getStreamSetId() const = 0;
+
+    /**
      * Get the stream's dimensions and format
      */
     virtual uint32_t getWidth() const = 0;
     virtual uint32_t getHeight() const = 0;
     virtual int      getFormat() const = 0;
     virtual android_dataspace getDataSpace() const = 0;
+    virtual void setFormatOverride(bool formatOverriden) = 0;
+    virtual bool isFormatOverridden() const = 0;
+    virtual int getOriginalFormat() const = 0;
+    virtual void setDataSpaceOverride(bool dataSpaceOverriden) = 0;
+    virtual bool isDataSpaceOverridden() const = 0;
+    virtual android_dataspace getOriginalDataSpace() const = 0;
+
+    /**
+     * Get a HAL3 handle for the stream, without starting stream configuration.
+     */
+    virtual camera3_stream* asHalStream() = 0;
 
     /**
      * Start the stream configuration process. Returns a handle to the stream's
@@ -85,7 +116,7 @@ class Camera3StreamInterface : public virtual RefBase {
      *   NO_MEMORY in case of an error registering buffers
      *   INVALID_OPERATION in case connecting to the consumer failed
      */
-    virtual status_t finishConfiguration(camera3_device *hal3Device) = 0;
+    virtual status_t finishConfiguration() = 0;
 
     /**
      * Cancels the stream configuration process. This returns the stream to the
@@ -176,12 +207,19 @@ class Camera3StreamInterface : public virtual RefBase {
      * Fill in the camera3_stream_buffer with the next valid buffer for this
      * stream, to hand over to the HAL.
      *
+     * Multiple surfaces could share the same HAL stream, but a request may
+     * be only for a subset of surfaces. In this case, the
+     * Camera3StreamInterface object needs the surface ID information to acquire
+     * buffers for those surfaces. For the case of single surface for a HAL
+     * stream, surface_ids parameter has no effect.
+     *
      * This method may only be called once finishConfiguration has been called.
      * For bidirectional streams, this method applies to the output-side
      * buffers.
      *
      */
-    virtual status_t getBuffer(camera3_stream_buffer *buffer) = 0;
+    virtual status_t getBuffer(camera3_stream_buffer *buffer,
+            const std::vector<size_t>& surface_ids = std::vector<size_t>()) = 0;
 
     /**
      * Return a buffer to the stream after use by the HAL.
@@ -200,8 +238,10 @@ class Camera3StreamInterface : public virtual RefBase {
      * For bidirectional streams, this method applies to the input-side
      * buffers.
      *
+     * Normally this call will block until the handed out buffer count is less than the stream
+     * max buffer count; if respectHalLimit is set to false, this is ignored.
      */
-    virtual status_t getInputBuffer(camera3_stream_buffer *buffer) = 0;
+    virtual status_t getInputBuffer(camera3_stream_buffer *buffer, bool respectHalLimit = true) = 0;
 
     /**
      * Return a buffer to the stream after use by the HAL.
@@ -243,6 +283,11 @@ class Camera3StreamInterface : public virtual RefBase {
     virtual status_t disconnect() = 0;
 
     /**
+     * Return if the buffer queue of the stream is abandoned.
+     */
+    virtual bool isAbandoned() const = 0;
+
+    /**
      * Debug dump of the stream's state.
      */
     virtual void     dump(int fd, const Vector<String16> &args) const = 0;
@@ -251,6 +296,15 @@ class Camera3StreamInterface : public virtual RefBase {
             wp<Camera3StreamBufferListener> listener) = 0;
     virtual void     removeBufferListener(
             const sp<Camera3StreamBufferListener>& listener) = 0;
+
+    /**
+     * Setting listner will remove previous listener (if exists)
+     * Only allow set listener during stream configuration because stream is guaranteed to be IDLE
+     * at this state, so setBufferFreedListener won't collide with onBufferFreed callbacks.
+     * Client is responsible to keep the listener object alive throughout the lifecycle of this
+     * Camera3Stream.
+     */
+    virtual void setBufferFreedListener(wp<Camera3StreamBufferFreedListener> listener) = 0;
 };
 
 } // namespace camera3

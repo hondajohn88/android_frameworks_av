@@ -16,18 +16,22 @@
 
 #pragma once
 
+#include <sys/types.h>
+
 #include "AudioPort.h"
 #include <RoutingStrategy.h>
 #include <utils/Errors.h>
 #include <utils/Timers.h>
 #include <utils/KeyedVector.h>
 #include <system/audio.h>
+#include "AudioSourceDescriptor.h"
 
 namespace android {
 
 class IOProfile;
 class AudioMix;
 class AudioPolicyClientInterface;
+class DeviceDescriptor;
 
 // descriptor for audio outputs. Used to maintain current configuration of each opened audio output
 // and keep track of the usage of this output by each audio stream type.
@@ -43,7 +47,7 @@ public:
 
     audio_port_handle_t getId() const;
     virtual audio_devices_t device() const;
-    virtual bool sharesHwModuleWith(const sp<AudioOutputDescriptor> outputDesc);
+    virtual bool sharesHwModuleWith(const sp<AudioOutputDescriptor>& outputDesc);
     virtual audio_devices_t supportedDevices();
     virtual bool isDuplicated() const { return false; }
     virtual uint32_t latency() { return 0; }
@@ -69,9 +73,12 @@ public:
 
     audio_module_handle_t getModuleHandle() const;
 
+    audio_patch_handle_t getPatchHandle() const { return mPatchHandle; };
+    void setPatchHandle(audio_patch_handle_t handle) { mPatchHandle = handle; };
+
     sp<AudioPort>       mPort;
     audio_devices_t mDevice;                   // current device this output is routed to
-    audio_patch_handle_t mPatchHandle;
+    audio_io_handle_t mIoHandle;           // output handle
     uint32_t mRefCount[AUDIO_STREAM_CNT]; // number of streams of each type using this output
     nsecs_t mStopTime[AUDIO_STREAM_CNT];
     float mCurVolume[AUDIO_STREAM_CNT];   // current stream volume in dB
@@ -81,6 +88,7 @@ public:
     AudioPolicyClientInterface *mClientInterface;
 
 protected:
+    audio_patch_handle_t mPatchHandle;
     audio_port_handle_t mId;
 };
 
@@ -97,7 +105,7 @@ public:
     void setIoHandle(audio_io_handle_t ioHandle);
 
     virtual audio_devices_t device() const;
-    virtual bool sharesHwModuleWith(const sp<AudioOutputDescriptor> outputDesc);
+    virtual bool sharesHwModuleWith(const sp<AudioOutputDescriptor>& outputDesc);
     virtual audio_devices_t supportedDevices();
     virtual uint32_t latency();
     virtual bool isDuplicated() const { return (mOutput1 != NULL && mOutput2 != NULL); }
@@ -116,14 +124,39 @@ public:
     virtual void toAudioPort(struct audio_port *port) const;
 
     const sp<IOProfile> mProfile;          // I/O profile this output derives from
-    audio_io_handle_t mIoHandle;           // output handle
     uint32_t mLatency;                  //
     audio_output_flags_t mFlags;   //
     AudioMix *mPolicyMix;             // non NULL when used by a dynamic policy
     sp<SwAudioOutputDescriptor> mOutput1;    // used by duplicated outputs: first output
     sp<SwAudioOutputDescriptor> mOutput2;    // used by duplicated outputs: second output
     uint32_t mDirectOpenCount; // number of clients using this output (direct outputs only)
+    audio_session_t mDirectClientSession; // session id of the direct output client
     uint32_t mGlobalRefCount;  // non-stream-specific ref count
+};
+
+// Audio output driven by an input device directly.
+class HwAudioOutputDescriptor: public AudioOutputDescriptor
+{
+public:
+    HwAudioOutputDescriptor(const sp<AudioSourceDescriptor>& source,
+                            AudioPolicyClientInterface *clientInterface);
+    virtual ~HwAudioOutputDescriptor() {}
+
+    status_t    dump(int fd);
+
+    virtual audio_devices_t supportedDevices();
+    virtual bool setVolume(float volume,
+                           audio_stream_type_t stream,
+                           audio_devices_t device,
+                           uint32_t delayMs,
+                           bool force);
+
+    virtual void toAudioPortConfig(struct audio_port_config *dstConfig,
+                           const struct audio_port_config *srcConfig = NULL) const;
+    virtual void toAudioPort(struct audio_port *port) const;
+
+    const sp<AudioSourceDescriptor> mSource;
+
 };
 
 class SwAudioOutputCollection :
@@ -159,5 +192,20 @@ public:
 
     status_t dump(int fd) const;
 };
+
+class HwAudioOutputCollection :
+        public DefaultKeyedVector< audio_io_handle_t, sp<HwAudioOutputDescriptor> >
+{
+public:
+    bool isStreamActive(audio_stream_type_t stream, uint32_t inPastMs = 0) const;
+
+    /**
+     * return true if any output is playing anything besides the stream to ignore
+     */
+    bool isAnyOutputActive(audio_stream_type_t streamToIgnore) const;
+
+    status_t dump(int fd) const;
+};
+
 
 }; // namespace android

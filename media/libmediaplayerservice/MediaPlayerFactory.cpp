@@ -26,12 +26,10 @@
 #include <media/stagefright/foundation/ADebug.h>
 #include <utils/Errors.h>
 #include <utils/misc.h>
-#include <../libstagefright/include/WVMExtractor.h>
 
 #include "MediaPlayerFactory.h"
 
 #include "TestPlayerStub.h"
-#include "StagefrightPlayer.h"
 #include "nuplayer/NuPlayerDriver.h"
 
 namespace android {
@@ -64,12 +62,6 @@ status_t MediaPlayerFactory::registerFactory_l(IFactory* factory,
 }
 
 static player_type getDefaultPlayerType() {
-    char value[PROPERTY_VALUE_MAX];
-    if (property_get("media.stagefright.use-awesome", value, NULL)
-            && (!strcmp("1", value) || !strcasecmp("true", value))) {
-        return STAGEFRIGHT_PLAYER;
-    }
-
     return NU_PLAYER;
 }
 
@@ -176,63 +168,6 @@ sp<MediaPlayerBase> MediaPlayerFactory::createPlayer(
  *                                                                           *
  *****************************************************************************/
 
-class StagefrightPlayerFactory :
-    public MediaPlayerFactory::IFactory {
-  public:
-    virtual float scoreFactory(const sp<IMediaPlayer>& /*client*/,
-                               int fd,
-                               int64_t offset,
-                               int64_t length,
-                               float /*curScore*/) {
-        if (legacyDrm()) {
-            sp<DataSource> source = new FileSource(dup(fd), offset, length);
-            String8 mimeType;
-            float confidence;
-            if (SniffWVM(source, &mimeType, &confidence, NULL /* format */)) {
-                return 1.0;
-            }
-        }
-
-        if (getDefaultPlayerType() == STAGEFRIGHT_PLAYER) {
-            char buf[20];
-            lseek(fd, offset, SEEK_SET);
-            read(fd, buf, sizeof(buf));
-            lseek(fd, offset, SEEK_SET);
-
-            uint32_t ident = *((uint32_t*)buf);
-
-            // Ogg vorbis?
-            if (ident == 0x5367674f) // 'OggS'
-                return 1.0;
-        }
-
-        return 0.0;
-    }
-
-    virtual float scoreFactory(const sp<IMediaPlayer>& /*client*/,
-                               const char* url,
-                               float /*curScore*/) {
-        if (legacyDrm() && !strncasecmp("widevine://", url, 11)) {
-            return 1.0;
-        }
-        return 0.0;
-    }
-
-    virtual sp<MediaPlayerBase> createPlayer(pid_t /* pid */) {
-        ALOGV(" create StagefrightPlayer");
-        return new StagefrightPlayer();
-    }
-  private:
-    bool legacyDrm() {
-        char value[PROPERTY_VALUE_MAX];
-        if (property_get("persist.sys.media.legacy-drm", value, NULL)
-                && (!strcmp("1", value) || !strcasecmp("true", value))) {
-            return true;
-        }
-        return false;
-    }
-};
-
 class NuPlayerFactory : public MediaPlayerFactory::IFactory {
   public:
     virtual float scoreFactory(const sp<IMediaPlayer>& /*client*/,
@@ -310,9 +245,12 @@ void MediaPlayerFactory::registerBuiltinFactories() {
     if (sInitComplete)
         return;
 
-    registerFactory_l(new StagefrightPlayerFactory(), STAGEFRIGHT_PLAYER);
-    registerFactory_l(new NuPlayerFactory(), NU_PLAYER);
-    registerFactory_l(new TestPlayerFactory(), TEST_PLAYER);
+    IFactory* factory = new NuPlayerFactory();
+    if (registerFactory_l(factory, NU_PLAYER) != OK)
+        delete factory;
+    factory = new TestPlayerFactory();
+    if (registerFactory_l(factory, TEST_PLAYER) != OK)
+        delete factory;
 
     sInitComplete = true;
 }

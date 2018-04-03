@@ -40,7 +40,7 @@ static bool FileHasAcceptableExtension(const char *extension) {
         ".mpeg", ".ogg", ".mid", ".smf", ".imy", ".wma", ".aac",
         ".wav", ".amr", ".midi", ".xmf", ".rtttl", ".rtx", ".ota",
         ".mkv", ".mka", ".webm", ".ts", ".fl", ".flac", ".mxmf",
-        ".avi", ".mpeg", ".mpg", ".awb", ".mpga"
+        ".avi", ".mpeg", ".mpg", ".awb", ".mpga", ".mov"
     };
     static const size_t kNumValidExtensions =
         sizeof(kValidExtensions) / sizeof(kValidExtensions[0]);
@@ -85,7 +85,8 @@ MediaScanResult StagefrightMediaScanner::processFileInternal(
     status_t status;
     if (fd < 0) {
         // couldn't open it locally, maybe the media server can?
-        status = mRetriever->setDataSource(NULL /* httpService */, path);
+        sp<IMediaHTTPService> nullService;
+        status = mRetriever->setDataSource(nullService, path);
     } else {
         status = mRetriever->setDataSource(fd, 0, 0x7ffffffffffffffL);
         close(fd);
@@ -122,6 +123,7 @@ MediaScanResult StagefrightMediaScanner::processFileInternal(
         { "writer", METADATA_KEY_WRITER },
         { "compilation", METADATA_KEY_COMPILATION },
         { "isdrm", METADATA_KEY_IS_DRM },
+        { "date", METADATA_KEY_DATE },
         { "width", METADATA_KEY_VIDEO_WIDTH },
         { "height", METADATA_KEY_VIDEO_HEIGHT },
     };

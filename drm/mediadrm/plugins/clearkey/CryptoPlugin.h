@@ -31,7 +31,7 @@ namespace clearkeydrm {
 
 class CryptoPlugin : public android::CryptoPlugin {
 public:
-    CryptoPlugin(const android::Vector<uint8_t>& sessionId) {
+    explicit CryptoPlugin(const android::Vector<uint8_t>& sessionId) {
         mInitStatus = setMediaDrmSession(sessionId);
     }
 
@@ -44,7 +44,7 @@ public:
 
     virtual ssize_t decrypt(
             bool secure, const KeyId keyId, const Iv iv,
-            Mode mode, const void* srcPtr,
+            Mode mode, const Pattern &pattern, const void* srcPtr,
             const SubSample* subSamples, size_t numSubSamples,
             void* dstPtr, android::AString* errorDetailMsg);
 

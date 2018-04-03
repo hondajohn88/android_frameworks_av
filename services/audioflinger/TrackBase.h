@@ -50,7 +50,6 @@ public:
 
     enum track_type {
         TYPE_DEFAULT,
-        TYPE_TIMED,
         TYPE_OUTPUT,
         TYPE_PATCH,
     };
@@ -62,38 +61,43 @@ public:
                                 audio_channel_mask_t channelMask,
                                 size_t frameCount,
                                 void *buffer,
-                                int sessionId,
-                                int uid,
-                                IAudioFlinger::track_flags_t flags,
+                                size_t bufferSize,
+                                audio_session_t sessionId,
+                                uid_t uid,
                                 bool isOut,
                                 alloc_type alloc = ALLOC_CBLK,
-                                track_type type = TYPE_DEFAULT);
+                                track_type type = TYPE_DEFAULT,
+                                audio_port_handle_t portId = AUDIO_PORT_HANDLE_NONE);
     virtual             ~TrackBase();
     virtual status_t    initCheck() const;
 
     virtual status_t    start(AudioSystem::sync_event_t event,
-                             int triggerSession) = 0;
+                             audio_session_t triggerSession) = 0;
     virtual void        stop() = 0;
             sp<IMemory> getCblk() const { return mCblkMemory; }
             audio_track_cblk_t* cblk() const { return mCblk; }
-            int         sessionId() const { return mSessionId; }
-            int         uid() const { return mUid; }
+            audio_session_t sessionId() const { return mSessionId; }
+            uid_t       uid() const { return mUid; }
+            audio_port_handle_t portId() const { return mPortId; }
     virtual status_t    setSyncEvent(const sp<SyncEvent>& event);
 
             sp<IMemory> getBuffers() const { return mBufferMemory; }
             void*       buffer() const { return mBuffer; }
-            bool        isFastTrack() const { return (mFlags & IAudioFlinger::TRACK_FAST) != 0; }
-            bool        isTimedTrack() const { return (mType == TYPE_TIMED); }
+            size_t      bufferSize() const { return mBufferSize; }
+    virtual bool        isFastTrack() const = 0;
             bool        isOutputTrack() const { return (mType == TYPE_OUTPUT); }
             bool        isPatchTrack() const { return (mType == TYPE_PATCH); }
             bool        isExternalTrack() const { return !isOutputTrack() && !isPatchTrack(); }
 
+    virtual void        invalidate() { mIsInvalid = true; }
+            bool        isInvalid() const { return mIsInvalid; }
+
+
 protected:
-                        TrackBase(const TrackBase&);
-                        TrackBase& operator = (const TrackBase&);
+    DISALLOW_COPY_AND_ASSIGN(TrackBase);
 
     // AudioBufferProvider interface
-    virtual status_t getNextBuffer(AudioBufferProvider::Buffer* buffer, int64_t pts) = 0;
+    virtual status_t getNextBuffer(AudioBufferProvider::Buffer* buffer) = 0;
     virtual void releaseBuffer(AudioBufferProvider::Buffer* buffer);
 
     // ExtendedAudioBufferProvider interface is only needed for Track,
@@ -131,8 +135,42 @@ protected:
         mTerminated = true;
     }
 
+    // Upper case characters are final states.
+    // Lower case characters are transitory.
+    const char *getTrackStateString() const {
+        if (isTerminated()) {
+            return "T ";
+        }
+        switch (mState) {
+        case IDLE:
+            return "I ";
+        case STOPPING_1: // for Fast and Offload
+            return "s1";
+        case STOPPING_2: // for Fast and Offload
+            return "s2";
+        case STOPPED:
+            return "S ";
+        case RESUMING:
+            return "r ";
+        case ACTIVE:
+            return "A ";
+        case PAUSING:
+            return "p ";
+        case PAUSED:
+            return "P ";
+        case FLUSHED:
+            return "F ";
+        case STARTING_1: // for RecordTrack
+            return "r1";
+        case STARTING_2: // for RecordTrack
+            return "r2";
+        default:
+            return "? ";
+        }
+    }
+
     bool isOut() const { return mIsOut; }
-                                    // true for Track and TimedTrack, false for RecordTrack,
+                                    // true for Track, false for RecordTrack,
                                     // this could be a track type if needed later
 
     const wp<ThreadBase> mThread;
@@ -142,6 +180,7 @@ protected:
     sp<IMemory>         mBufferMemory;  // currently non-0 for fast RecordTrack only
     void*               mBuffer;    // start of track buffer, typically in shared memory
                                     // except for OutputTrack when it is in local memory
+    size_t              mBufferSize; // size of mBuffer in bytes
     // we don't really need a lock for these
     track_state         mState;
     const uint32_t      mSampleRate;    // initial sample rate only; for tracks which
@@ -155,18 +194,19 @@ protected:
     const size_t        mFrameCount;// size of track buffer given at createTrack() or
                                     // openRecord(), and then adjusted as needed
 
-    const int           mSessionId;
-    int                 mUid;
+    const audio_session_t mSessionId;
+    uid_t               mUid;
     Vector < sp<SyncEvent> >mSyncEvents;
-    const IAudioFlinger::track_flags_t mFlags;
     const bool          mIsOut;
-    ServerProxy*        mServerProxy;
+    sp<ServerProxy>     mServerProxy;
     const int           mId;
     sp<NBAIO_Sink>      mTeeSink;
     sp<NBAIO_Source>    mTeeSource;
     bool                mTerminated;
     track_type          mType;      // must be one of TYPE_DEFAULT, TYPE_OUTPUT, TYPE_PATCH ...
     audio_io_handle_t   mThreadIoHandle; // I/O handle of the thread the track is attached to
+    audio_port_handle_t mPortId; // unique ID for this track used by audio policy
+    bool                mIsInvalid; // non-resettable latch, set by invalidate()
 };
 
 // PatchProxyBufferProvider interface is implemented by PatchTrack and PatchRecord.

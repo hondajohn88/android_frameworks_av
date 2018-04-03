@@ -26,8 +26,25 @@ namespace android {
 
 status_t setNativeWindowSizeFormatAndUsage(
         ANativeWindow *nativeWindow /* nonnull */,
-        int width, int height, int format, int rotation, int usage) {
-    status_t err = native_window_set_buffers_dimensions(nativeWindow, width, height);
+        int width, int height, int format, int rotation, int usage, bool reconnect) {
+    status_t err = NO_ERROR;
+
+    // In some cases we need to reconnect so that we can dequeue all buffers
+    if (reconnect) {
+        err = nativeWindowDisconnect(nativeWindow, "setNativeWindowSizeFormatAndUsage");
+        if (err != NO_ERROR) {
+            ALOGE("nativeWindowDisconnect failed: %s (%d)", strerror(-err), -err);
+            return err;
+        }
+
+        err = nativeWindowConnect(nativeWindow, "setNativeWindowSizeFormatAndUsage");
+        if (err != NO_ERROR) {
+            ALOGE("nativeWindowConnect failed: %s (%d)", strerror(-err), -err);
+            return err;
+        }
+    }
+
+    err = native_window_set_buffers_dimensions(nativeWindow, width, height);
     if (err != NO_ERROR) {
         ALOGE("native_window_set_buffers_dimensions failed: %s (%d)", strerror(-err), -err);
         return err;
@@ -55,11 +72,17 @@ status_t setNativeWindowSizeFormatAndUsage(
         return err;
     }
 
+    int consumerUsage = 0;
+    err = nativeWindow->query(nativeWindow, NATIVE_WINDOW_CONSUMER_USAGE_BITS, &consumerUsage);
+    if (err != NO_ERROR) {
+        ALOGW("failed to get consumer usage bits. ignoring");
+        err = NO_ERROR;
+    }
+
     // Make sure to check whether either Stagefright or the video decoder
     // requested protected buffers.
     if (usage & GRALLOC_USAGE_PROTECTED) {
-        // Verify that the ANativeWindow sends images directly to
-        // SurfaceFlinger.
+        // Check if the ANativeWindow sends images directly to SurfaceFlinger.
         int queuesToNativeWindow = 0;
         err = nativeWindow->query(
                 nativeWindow, NATIVE_WINDOW_QUEUES_TO_WINDOW_COMPOSER, &queuesToNativeWindow);
@@ -67,17 +90,22 @@ status_t setNativeWindowSizeFormatAndUsage(
             ALOGE("error authenticating native window: %s (%d)", strerror(-err), -err);
             return err;
         }
-        if (queuesToNativeWindow != 1) {
-            ALOGE("native window could not be authenticated");
+
+        // Check if the consumer end of the ANativeWindow can handle protected content.
+        int isConsumerProtected = 0;
+        err = nativeWindow->query(
+                nativeWindow, NATIVE_WINDOW_CONSUMER_IS_PROTECTED, &isConsumerProtected);
+        if (err != NO_ERROR) {
+            ALOGE("error query native window: %s (%d)", strerror(-err), -err);
+            return err;
+        }
+
+        // Deny queuing into native window if neither condition is satisfied.
+        if (queuesToNativeWindow != 1 && isConsumerProtected != 1) {
+            ALOGE("native window cannot handle protected buffers: the consumer should either be "
+                  "a hardware composer or support hardware protection");
             return PERMISSION_DENIED;
         }
-    }
-
-    int consumerUsage = 0;
-    err = nativeWindow->query(nativeWindow, NATIVE_WINDOW_CONSUMER_USAGE_BITS, &consumerUsage);
-    if (err != NO_ERROR) {
-        ALOGW("failed to get consumer usage bits. ignoring");
-        err = NO_ERROR;
     }
 
     int finalUsage = usage | consumerUsage;
@@ -109,7 +137,7 @@ status_t pushBlankBuffersToNativeWindow(ANativeWindow *nativeWindow /* nonnull *
     // We need to reconnect to the ANativeWindow as a CPU client to ensure that
     // no frames get dropped by SurfaceFlinger assuming that these are video
     // frames.
-    err = native_window_api_disconnect(nativeWindow, NATIVE_WINDOW_API_MEDIA);
+    err = nativeWindowDisconnect(nativeWindow, "pushBlankBuffersToNativeWindow");
     if (err != NO_ERROR) {
         ALOGE("error pushing blank frames: api_disconnect failed: %s (%d)", strerror(-err), -err);
         return err;
@@ -118,12 +146,13 @@ status_t pushBlankBuffersToNativeWindow(ANativeWindow *nativeWindow /* nonnull *
     err = native_window_api_connect(nativeWindow, NATIVE_WINDOW_API_CPU);
     if (err != NO_ERROR) {
         ALOGE("error pushing blank frames: api_connect failed: %s (%d)", strerror(-err), -err);
-        (void)native_window_api_connect(nativeWindow, NATIVE_WINDOW_API_MEDIA);
+        (void)nativeWindowConnect(nativeWindow, "pushBlankBuffersToNativeWindow(err)");
         return err;
     }
 
     err = setNativeWindowSizeFormatAndUsage(
-            nativeWindow, 1, 1, HAL_PIXEL_FORMAT_RGBX_8888, 0, GRALLOC_USAGE_SW_WRITE_OFTEN);
+            nativeWindow, 1, 1, HAL_PIXEL_FORMAT_RGBX_8888, 0, GRALLOC_USAGE_SW_WRITE_OFTEN,
+            false /* reconnect */);
     if (err != NO_ERROR) {
         goto error;
     }
@@ -157,7 +186,7 @@ status_t pushBlankBuffersToNativeWindow(ANativeWindow *nativeWindow /* nonnull *
             break;
         }
 
-        sp<GraphicBuffer> buf(new GraphicBuffer(anb, false));
+        sp<GraphicBuffer> buf(GraphicBuffer::from(anb));
 
         // Fill the buffer with the a 1x1 checkerboard pattern ;)
         uint32_t *img = NULL;
@@ -200,7 +229,7 @@ error:
         }
     }
 
-    err2 = native_window_api_connect(nativeWindow, NATIVE_WINDOW_API_MEDIA);
+    err2 = nativeWindowConnect(nativeWindow, "pushBlankBuffersToNativeWindow(err2)");
     if (err2 != NO_ERROR) {
         ALOGE("error pushing blank frames: api_connect failed: %s (%d)", strerror(-err), -err);
         if (err == NO_ERROR) {
@@ -211,5 +240,22 @@ error:
     return err;
 }
 
+status_t nativeWindowConnect(ANativeWindow *surface, const char *reason) {
+    ALOGD("connecting to surface %p, reason %s", surface, reason);
+
+    status_t err = native_window_api_connect(surface, NATIVE_WINDOW_API_MEDIA);
+    ALOGE_IF(err != OK, "Failed to connect to surface %p, err %d", surface, err);
+
+    return err;
+}
+
+status_t nativeWindowDisconnect(ANativeWindow *surface, const char *reason) {
+    ALOGD("disconnecting from surface %p, reason %s", surface, reason);
+
+    status_t err = native_window_api_disconnect(surface, NATIVE_WINDOW_API_MEDIA);
+    ALOGE_IF(err != OK, "Failed to disconnect from surface %p, err %d", surface, err);
+
+    return err;
+}
 }  // namespace android
 

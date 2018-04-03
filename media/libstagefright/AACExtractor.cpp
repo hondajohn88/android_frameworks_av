@@ -174,7 +174,9 @@ AACExtractor::AACExtractor(
     if (mDataSource->getSize(&streamSize) == OK) {
          while (offset < streamSize) {
             if ((frameSize = getAdtsFrameLength(source, offset, NULL)) == 0) {
-                return;
+                ALOGW("prematured AAC stream (%lld vs %lld)",
+                        (long long)offset, (long long)streamSize);
+                break;
             }
 
             mOffsetVector.push(offset);
@@ -211,7 +213,7 @@ size_t AACExtractor::countTracks() {
     return mInitCheck == OK ? 1 : 0;
 }
 
-sp<MediaSource> AACExtractor::getTrack(size_t index) {
+sp<IMediaSource> AACExtractor::getTrack(size_t index) {
     if (mInitCheck != OK || index != 0) {
         return NULL;
     }
@@ -292,6 +294,10 @@ status_t AACSource::read(
     if (options && options->getSeekTo(&seekTimeUs, &mode)) {
         if (mFrameDurationUs > 0) {
             int64_t seekFrame = seekTimeUs / mFrameDurationUs;
+            if (seekFrame < 0 || seekFrame >= (int64_t)mOffsetVector.size()) {
+                android_errorWriteLog(0x534e4554, "70239507");
+                return ERROR_MALFORMED;
+            }
             mCurrentTimeUs = seekFrame * mFrameDurationUs;
 
             mOffset = mOffsetVector.itemAt(seekFrame);

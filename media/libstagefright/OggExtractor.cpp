@@ -46,7 +46,7 @@ extern "C" {
 namespace android {
 
 struct OggSource : public MediaSource {
-    OggSource(const sp<OggExtractor> &extractor);
+    explicit OggSource(const sp<OggExtractor> &extractor);
 
     virtual sp<MetaData> getFormat();
 
@@ -164,7 +164,7 @@ protected:
 };
 
 struct MyVorbisExtractor : public MyOggExtractor {
-    MyVorbisExtractor(const sp<DataSource> &source)
+    explicit MyVorbisExtractor(const sp<DataSource> &source)
         : MyOggExtractor(source,
                 MEDIA_MIMETYPE_AUDIO_VORBIS,
                 /* numHeaders */ 3,
@@ -179,6 +179,9 @@ struct MyVorbisExtractor : public MyOggExtractor {
 
 protected:
     virtual int64_t getTimeUsOfGranule(uint64_t granulePos) const {
+        if (granulePos > INT64_MAX / 1000000ll) {
+            return INT64_MAX;
+        }
         return granulePos * 1000000ll / mVi.rate;
     }
 
@@ -189,7 +192,7 @@ struct MyOpusExtractor : public MyOggExtractor {
     static const int32_t kOpusSampleRate = 48000;
     static const int64_t kOpusSeekPreRollUs = 80000; // 80 ms
 
-    MyOpusExtractor(const sp<DataSource> &source)
+    explicit MyOpusExtractor(const sp<DataSource> &source)
         : MyOggExtractor(source, MEDIA_MIMETYPE_AUDIO_OPUS, /*numHeaders*/ 2, kOpusSeekPreRollUs),
           mChannelCount(0),
           mCodecDelay(0),
@@ -575,6 +578,10 @@ status_t MyOpusExtractor::readNextPacket(MediaBuffer **out) {
             }
             // First two pages are header pages.
             if (err == ERROR_END_OF_STREAM || mCurrentPage.mPageNo > 2) {
+                if (mBuf != NULL) {
+                    mBuf->release();
+                    mBuf = NULL;
+                }
                 break;
             }
             curGranulePosition = mCurrentPage.mGranulePosition;
@@ -694,7 +701,21 @@ status_t MyOggExtractor::_readNextPacket(MediaBuffer **out, bool calcVorbisTimes
             if (buffer != NULL) {
                 fullSize += buffer->range_length();
             }
-            MediaBuffer *tmp = new MediaBuffer(fullSize);
+            if (fullSize > 16 * 1024 * 1024) { // arbitrary limit of 16 MB packet size
+                if (buffer != NULL) {
+                    buffer->release();
+                }
+                ALOGE("b/36592202");
+                return ERROR_MALFORMED;
+            }
+            MediaBuffer *tmp = new (std::nothrow) MediaBuffer(fullSize);
+            if (tmp == NULL) {
+                if (buffer != NULL) {
+                    buffer->release();
+                }
+                ALOGE("b/36592202");
+                return ERROR_MALFORMED;
+            }
             if (buffer != NULL) {
                 memcpy(tmp->data(), buffer->data(), buffer->range_length());
                 tmp->set_range(0, buffer->range_length());
@@ -710,6 +731,7 @@ status_t MyOggExtractor::_readNextPacket(MediaBuffer **out, bool calcVorbisTimes
                     packetSize);
 
             if (n < (ssize_t)packetSize) {
+                buffer->release();
                 ALOGV("failed to read %zu bytes at %#016llx, got %zd bytes",
                         packetSize, (long long)dataOffset, n);
                 return ERROR_IO;
@@ -771,8 +793,13 @@ status_t MyOggExtractor::_readNextPacket(MediaBuffer **out, bool calcVorbisTimes
             return n < 0 ? n : (status_t)ERROR_END_OF_STREAM;
         }
 
-        mCurrentPageSamples =
-            mCurrentPage.mGranulePosition - mPrevGranulePosition;
+        // Prevent a harmless unsigned integer overflow by clamping to 0
+        if (mCurrentPage.mGranulePosition >= mPrevGranulePosition) {
+            mCurrentPageSamples =
+                    mCurrentPage.mGranulePosition - mPrevGranulePosition;
+        } else {
+            mCurrentPageSamples = 0;
+        }
         mFirstPacketInPage = true;
 
         mPrevGranulePosition = mCurrentPage.mGranulePosition;
@@ -917,6 +944,9 @@ int64_t MyOpusExtractor::getTimeUsOfGranule(uint64_t granulePos) const {
     if (granulePos > mCodecDelay) {
         pcmSamplePosition = granulePos - mCodecDelay;
     }
+    if (pcmSamplePosition > INT64_MAX / 1000000ll) {
+        return INT64_MAX;
+    }
     return pcmSamplePosition * 1000000ll / kOpusSampleRate;
 }
 
@@ -954,7 +984,7 @@ status_t MyOpusExtractor::verifyOpusHeader(MediaBuffer *buffer) {
     mMeta->setInt32(kKeyChannelCount, mChannelCount);
     mMeta->setInt64(kKeyOpusSeekPreRoll /* ns */, kOpusSeekPreRollUs * 1000 /* = 80 ms*/);
     mMeta->setInt64(kKeyOpusCodecDelay /* ns */,
-            mCodecDelay /* sample/s */ * 1000000000 / kOpusSampleRate);
+            mCodecDelay /* sample/s */ * 1000000000ll / kOpusSampleRate);
 
     return OK;
 }
@@ -1254,16 +1284,16 @@ static void extractAlbumArt(
         return;
     }
 
-    descLen = U32_AT(&flac[8 + typeLen]);
+    if (flacSize < 32 || flacSize - 32 < typeLen) {
+        return;
+    }
 
-    if (flacSize < 32 ||
-        flacSize - 32 < typeLen ||
-        flacSize - 32 - typeLen < descLen) {
+    descLen = U32_AT(&flac[8 + typeLen]);
+    if (flacSize - 32 - typeLen < descLen) {
         return;
     }
 
     dataLen = U32_AT(&flac[8 + typeLen + 4 + descLen + 16]);
-
 
     // we've already checked above that (flacSize - 32 - typeLen - descLen) >= 0
     if (flacSize - 32 - typeLen - descLen < dataLen) {
@@ -1314,7 +1344,7 @@ size_t OggExtractor::countTracks() {
     return mInitCheck != OK ? 0 : 1;
 }
 
-sp<MediaSource> OggExtractor::getTrack(size_t index) {
+sp<IMediaSource> OggExtractor::getTrack(size_t index) {
     if (index >= 1) {
         return NULL;
     }

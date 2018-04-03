@@ -18,11 +18,14 @@
 
 #define STAGEFRIGHT_RECORDER_H_
 
+#include <media/MediaAnalyticsItem.h>
 #include <media/MediaRecorderBase.h>
 #include <camera/CameraParameters.h>
 #include <utils/String8.h>
 
 #include <system/audio.h>
+
+#include <MetadataBufferType.h>
 
 namespace android {
 
@@ -30,20 +33,17 @@ class Camera;
 class ICameraRecordingProxy;
 class CameraSource;
 class CameraSourceTimeLapse;
+struct MediaCodecSource;
 struct MediaSource;
 struct MediaWriter;
 class MetaData;
 struct AudioSource;
 class MediaProfiles;
-class IGraphicBufferConsumer;
-class IGraphicBufferProducer;
-class SurfaceMediaSource;
 struct ALooper;
 
 struct StagefrightRecorder : public MediaRecorderBase {
-    StagefrightRecorder(const String16 &opPackageName);
+    explicit StagefrightRecorder(const String16 &opPackageName);
     virtual ~StagefrightRecorder();
-
     virtual status_t init();
     virtual status_t setAudioSource(audio_source_t as);
     virtual status_t setVideoSource(video_source vs);
@@ -52,35 +52,45 @@ struct StagefrightRecorder : public MediaRecorderBase {
     virtual status_t setVideoEncoder(video_encoder ve);
     virtual status_t setVideoSize(int width, int height);
     virtual status_t setVideoFrameRate(int frames_per_second);
-    virtual status_t setCamera(const sp<ICamera>& camera, const sp<ICameraRecordingProxy>& proxy);
+    virtual status_t setCamera(const sp<hardware::ICamera>& camera, const sp<ICameraRecordingProxy>& proxy);
     virtual status_t setPreviewSurface(const sp<IGraphicBufferProducer>& surface);
-    virtual status_t setInputSurface(const sp<IGraphicBufferConsumer>& surface);
-    virtual status_t setOutputFile(int fd, int64_t offset, int64_t length);
-    virtual status_t setParameters(const String8& params);
-    virtual status_t setListener(const sp<IMediaRecorderClient>& listener);
-    virtual status_t setClientName(const String16& clientName);
+    virtual status_t setInputSurface(const sp<PersistentSurface>& surface);
+    virtual status_t setOutputFile(int fd);
+    virtual status_t setNextOutputFile(int fd);
+    virtual status_t setParameters(const String8 &params);
+    virtual status_t setListener(const sp<IMediaRecorderClient> &listener);
+    virtual status_t setClientName(const String16 &clientName);
     virtual status_t prepare();
     virtual status_t start();
     virtual status_t pause();
+    virtual status_t resume();
     virtual status_t stop();
     virtual status_t close();
     virtual status_t reset();
     virtual status_t getMaxAmplitude(int *max);
-    virtual status_t dump(int fd, const Vector<String16>& args) const;
+    virtual status_t getMetrics(Parcel *reply);
+    virtual status_t dump(int fd, const Vector<String16> &args) const;
     // Querying a SurfaceMediaSourcer
     virtual sp<IGraphicBufferProducer> querySurfaceMediaSource() const;
 
 private:
-    sp<ICamera> mCamera;
+    mutable Mutex mLock;
+    sp<hardware::ICamera> mCamera;
     sp<ICameraRecordingProxy> mCameraProxy;
     sp<IGraphicBufferProducer> mPreviewSurface;
-    sp<IGraphicBufferConsumer> mPersistentSurface;
+    sp<PersistentSurface> mPersistentSurface;
     sp<IMediaRecorderClient> mListener;
     String16 mClientName;
     uid_t mClientUid;
+    pid_t mClientPid;
     sp<MediaWriter> mWriter;
     int mOutputFd;
     sp<AudioSource> mAudioSourceNode;
+
+    MediaAnalyticsItem *mAnalyticsItem;
+    bool mAnalyticsDirty;
+    void resetMetrics();
+    void updateMetrics();
 
     audio_source_t mAudioSource;
     video_source mVideoSource;
@@ -112,14 +122,19 @@ private:
     int32_t mTotalBitRate;
 
     bool mCaptureFpsEnable;
-    float mCaptureFps;
+    double mCaptureFps;
     int64_t mTimeBetweenCaptureUs;
     sp<CameraSourceTimeLapse> mCameraSourceTimeLapse;
 
     String8 mParams;
 
-    bool mIsMetaDataStoredInVideoBuffers;
+    MetadataBufferType mMetaDataStoredInVideoBuffers;
     MediaProfiles *mEncoderProfiles;
+
+    int64_t mPauseStartTimeUs;
+    int64_t mTotalPausedDurationUs;
+    sp<MediaCodecSource> mAudioEncoderSource;
+    sp<MediaCodecSource> mVideoEncoderSource;
 
     bool mStarted;
     // Needed when GLFrames are encoded.
@@ -139,7 +154,7 @@ private:
     status_t setupRawAudioRecording();
     status_t setupRTPRecording();
     status_t setupMPEG2TSRecording();
-    sp<MediaSource> createAudioSource();
+    sp<MediaCodecSource> createAudioSource();
     status_t checkVideoEncoderCapabilities();
     status_t checkAudioEncoderCapabilities();
     // Generic MediaSource set-up. Returns the appropriate
@@ -148,7 +163,7 @@ private:
     status_t setupMediaSource(sp<MediaSource> *mediaSource);
     status_t setupCameraSource(sp<CameraSource> *cameraSource);
     status_t setupAudioEncoder(const sp<MediaWriter>& writer);
-    status_t setupVideoEncoder(sp<MediaSource> cameraSource, sp<MediaSource> *source);
+    status_t setupVideoEncoder(const sp<MediaSource>& cameraSource, sp<MediaCodecSource> *source);
 
     // Encoding parameter handling utilities
     status_t setParameter(const String8 &key, const String8 &value);
@@ -157,7 +172,7 @@ private:
     status_t setParamAudioSamplingRate(int32_t sampleRate);
     status_t setParamAudioTimeScale(int32_t timeScale);
     status_t setParamCaptureFpsEnable(int32_t timeLapseEnable);
-    status_t setParamCaptureFps(float fps);
+    status_t setParamCaptureFps(double fps);
     status_t setParamVideoEncodingBitRate(int32_t bitRate);
     status_t setParamVideoIFramesInterval(int32_t seconds);
     status_t setParamVideoEncoderProfile(int32_t profile);

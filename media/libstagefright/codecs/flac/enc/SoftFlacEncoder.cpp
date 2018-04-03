@@ -154,12 +154,40 @@ OMX_ERRORTYPE SoftFlacEncoder::internalGetParameter(
     ALOGV("SoftFlacEncoder::internalGetParameter(index=0x%x)", index);
 
     switch (index) {
+        case OMX_IndexParamAudioPortFormat:
+        {
+            OMX_AUDIO_PARAM_PORTFORMATTYPE *formatParams =
+                (OMX_AUDIO_PARAM_PORTFORMATTYPE *)params;
+
+            if (!isValidOMXParam(formatParams)) {
+                return OMX_ErrorBadParameter;
+            }
+
+            if (formatParams->nPortIndex > 1) {
+                return OMX_ErrorUndefined;
+            }
+
+            if (formatParams->nIndex > 0) {
+                return OMX_ErrorNoMore;
+            }
+
+            formatParams->eEncoding =
+                (formatParams->nPortIndex == 0)
+                    ? OMX_AUDIO_CodingPCM : OMX_AUDIO_CodingFLAC;
+
+            return OMX_ErrorNone;
+        }
+
         case OMX_IndexParamAudioPcm:
         {
             OMX_AUDIO_PARAM_PCMMODETYPE *pcmParams =
                 (OMX_AUDIO_PARAM_PCMMODETYPE *)params;
 
-            if (pcmParams->nPortIndex > 1) {
+            if (!isValidOMXParam(pcmParams)) {
+                return OMX_ErrorBadParameter;
+            }
+
+            if (pcmParams->nPortIndex != 0) {
                 return OMX_ErrorUndefined;
             }
 
@@ -180,6 +208,15 @@ OMX_ERRORTYPE SoftFlacEncoder::internalGetParameter(
         case OMX_IndexParamAudioFlac:
         {
             OMX_AUDIO_PARAM_FLACTYPE *flacParams = (OMX_AUDIO_PARAM_FLACTYPE *)params;
+
+            if (!isValidOMXParam(flacParams)) {
+                return OMX_ErrorBadParameter;
+            }
+
+            if (flacParams->nPortIndex != 1) {
+                return OMX_ErrorUndefined;
+            }
+
             flacParams->nCompressionLevel = mCompressionLevel;
             flacParams->nChannels = mNumChannels;
             flacParams->nSampleRate = mSampleRate;
@@ -194,12 +231,39 @@ OMX_ERRORTYPE SoftFlacEncoder::internalGetParameter(
 OMX_ERRORTYPE SoftFlacEncoder::internalSetParameter(
         OMX_INDEXTYPE index, const OMX_PTR params) {
     switch (index) {
+        case OMX_IndexParamAudioPortFormat:
+        {
+            const OMX_AUDIO_PARAM_PORTFORMATTYPE *formatParams =
+                (const OMX_AUDIO_PARAM_PORTFORMATTYPE *)params;
+
+            if (!isValidOMXParam(formatParams)) {
+                return OMX_ErrorBadParameter;
+            }
+
+            if (formatParams->nPortIndex > 1) {
+                return OMX_ErrorUndefined;
+            }
+
+            if ((formatParams->nPortIndex == 0
+                        && formatParams->eEncoding != OMX_AUDIO_CodingPCM)
+                || (formatParams->nPortIndex == 1
+                        && formatParams->eEncoding != OMX_AUDIO_CodingFLAC)) {
+                return OMX_ErrorUndefined;
+            }
+
+            return OMX_ErrorNone;
+        }
+
         case OMX_IndexParamAudioPcm:
         {
             ALOGV("SoftFlacEncoder::internalSetParameter(OMX_IndexParamAudioPcm)");
             OMX_AUDIO_PARAM_PCMMODETYPE *pcmParams = (OMX_AUDIO_PARAM_PCMMODETYPE *)params;
 
-            if (pcmParams->nPortIndex != 0 && pcmParams->nPortIndex != 1) {
+            if (!isValidOMXParam(pcmParams)) {
+                return OMX_ErrorBadParameter;
+            }
+
+            if (pcmParams->nPortIndex != 0) {
                 ALOGE("SoftFlacEncoder::internalSetParameter() Error #1");
                 return OMX_ErrorUndefined;
             }
@@ -221,6 +285,10 @@ OMX_ERRORTYPE SoftFlacEncoder::internalSetParameter(
             const OMX_PARAM_COMPONENTROLETYPE *roleParams =
                 (const OMX_PARAM_COMPONENTROLETYPE *)params;
 
+            if (!isValidOMXParam(roleParams)) {
+                return OMX_ErrorBadParameter;
+            }
+
             if (strncmp((const char *)roleParams->cRole,
                     "audio_encoder.flac",
                     OMX_MAX_STRINGNAME_SIZE - 1)) {
@@ -236,6 +304,15 @@ OMX_ERRORTYPE SoftFlacEncoder::internalSetParameter(
         {
             // used only for setting the compression level
             OMX_AUDIO_PARAM_FLACTYPE *flacParams = (OMX_AUDIO_PARAM_FLACTYPE *)params;
+
+            if (!isValidOMXParam(flacParams)) {
+                return OMX_ErrorBadParameter;
+            }
+
+            if (flacParams->nPortIndex != 1) {
+                return OMX_ErrorUndefined;
+            }
+
             mCompressionLevel = flacParams->nCompressionLevel; // range clamping done inside encoder
             return OMX_ErrorNone;
         }
@@ -244,6 +321,10 @@ OMX_ERRORTYPE SoftFlacEncoder::internalSetParameter(
         {
             OMX_PARAM_PORTDEFINITIONTYPE *defParams =
                 (OMX_PARAM_PORTDEFINITIONTYPE *)params;
+
+            if (!isValidOMXParam(defParams)) {
+                return OMX_ErrorBadParameter;
+            }
 
             if (defParams->nPortIndex == 0) {
                 if (defParams->nBufferSize > kMaxInputBufferSize) {

@@ -18,7 +18,7 @@
 
 #define SOFT_VPX_H_
 
-#include "SoftVideoDecoderOMXComponent.h"
+#include <media/stagefright/omx/SoftVideoDecoderOMXComponent.h>
 
 #include "vpx/vpx_decoder.h"
 #include "vpx/vpx_codec.h"
@@ -66,6 +66,7 @@ private:
     status_t initDecoder();
     status_t destroyDecoder();
     bool outputBuffers(bool flushDecoder, bool display, bool eos, bool *portWillReset);
+    bool outputBufferSafe(OMX_BUFFERHEADERTYPE *outHeader);
 
     DISALLOW_EVIL_CONSTRUCTORS(SoftVPX);
 };

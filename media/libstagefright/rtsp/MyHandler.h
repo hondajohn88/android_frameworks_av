@@ -25,6 +25,7 @@
 #endif
 
 #include <utils/Log.h>
+#include <cutils/properties.h> // for property_get
 
 #include "APacketSource.h"
 #include "ARTPConnection.h"
@@ -32,6 +33,7 @@
 #include "ASessionDescription.h"
 
 #include <ctype.h>
+#include <cutils/properties.h>
 
 #include <media/stagefright/foundation/ABuffer.h>
 #include <media/stagefright/foundation/ADebug.h>
@@ -63,6 +65,10 @@ static int64_t kStartupTimeoutUs = 10000000ll;
 static int64_t kDefaultKeepAliveTimeoutUs = 60000000ll;
 
 static int64_t kPauseDelayUs = 3000000ll;
+
+// The allowed maximum number of stale access units at the beginning of
+// a new sequence.
+static int32_t kMaxAllowedStaleAccessUnits = 20;
 
 namespace android {
 
@@ -130,7 +136,7 @@ struct MyHandler : public AHandler {
           mCheckPending(false),
           mCheckGeneration(0),
           mCheckTimeoutGeneration(0),
-          mTryTCPInterleaving(false),
+          mTryTCPInterleaving(property_get_bool("rtp.transport.TCP", false)),
           mTryFakeRTCP(false),
           mReceivedFirstRTCPPacket(false),
           mReceivedFirstRTPPacket(false),
@@ -235,7 +241,7 @@ struct MyHandler : public AHandler {
         sp<AMessage> msg = new AMessage('paus', this);
         mPauseGeneration++;
         msg->setInt32("pausecheck", mPauseGeneration);
-        msg->post(kPauseDelayUs);
+        msg->post();
     }
 
     void resume() {
@@ -803,11 +809,7 @@ struct MyHandler : public AHandler {
                         result = UNKNOWN_ERROR;
                     } else {
                         parsePlayResponse(response);
-
-                        sp<AMessage> timeout = new AMessage('tiou', this);
-                        mCheckTimeoutGeneration++;
-                        timeout->setInt32("tioucheck", mCheckTimeoutGeneration);
-                        timeout->post(kStartupTimeoutUs);
+                        postTimeout();
                     }
                 }
 
@@ -979,6 +981,11 @@ struct MyHandler : public AHandler {
 
             case 'accu':
             {
+                if (mSeekPending) {
+                    ALOGV("Stale access unit.");
+                    break;
+                }
+
                 int32_t timeUpdate;
                 if (msg->findInt32("time-update", &timeUpdate) && timeUpdate) {
                     size_t trackIndex;
@@ -1033,26 +1040,13 @@ struct MyHandler : public AHandler {
                     return;
                 }
 
-                sp<ABuffer> accessUnit;
-                CHECK(msg->findBuffer("access-unit", &accessUnit));
-
-                uint32_t seqNum = (uint32_t)accessUnit->int32Data();
-
                 if (mSeekPending) {
                     ALOGV("we're seeking, dropping stale packet.");
                     break;
                 }
 
-                if (seqNum < track->mFirstSeqNumInSegment) {
-                    ALOGV("dropping stale access-unit (%d < %d)",
-                         seqNum, track->mFirstSeqNumInSegment);
-                    break;
-                }
-
-                if (track->mNewSegment) {
-                    track->mNewSegment = false;
-                }
-
+                sp<ABuffer> accessUnit;
+                CHECK(msg->findBuffer("access-unit", &accessUnit));
                 onAccessUnitComplete(trackIndex, accessUnit);
                 break;
             }
@@ -1070,6 +1064,12 @@ struct MyHandler : public AHandler {
                     ALOGW("This is a live stream, ignoring pause request.");
                     break;
                 }
+
+                if (mPausing) {
+                    ALOGV("This stream is already paused.");
+                    break;
+                }
+
                 mCheckPending = true;
                 ++mCheckGeneration;
                 mPausing = true;
@@ -1131,10 +1131,11 @@ struct MyHandler : public AHandler {
                 int32_t result;
                 CHECK(msg->findInt32("result", &result));
 
-                ALOGI("PLAY completed with result %d (%s)",
+                ALOGI("PLAY (for resume) completed with result %d (%s)",
                      result, strerror(-result));
 
                 mCheckPending = false;
+                ++mCheckGeneration;
                 postAccessUnitTimeoutCheck();
 
                 if (result == OK) {
@@ -1150,10 +1151,7 @@ struct MyHandler : public AHandler {
 
                         // Post new timeout in order to make sure to use
                         // fake timestamps if no new Sender Reports arrive
-                        sp<AMessage> timeout = new AMessage('tiou', this);
-                        mCheckTimeoutGeneration++;
-                        timeout->setInt32("tioucheck", mCheckTimeoutGeneration);
-                        timeout->post(kStartupTimeoutUs);
+                        postTimeout();
                     }
                 }
 
@@ -1245,10 +1243,7 @@ struct MyHandler : public AHandler {
 
                 // Start new timeoutgeneration to avoid getting timeout
                 // before PLAY response arrive
-                sp<AMessage> timeout = new AMessage('tiou', this);
-                mCheckTimeoutGeneration++;
-                timeout->setInt32("tioucheck", mCheckTimeoutGeneration);
-                timeout->post(kStartupTimeoutUs);
+                postTimeout();
 
                 int64_t timeUs;
                 CHECK(msg->findInt64("time", &timeUs));
@@ -1282,10 +1277,11 @@ struct MyHandler : public AHandler {
                 int32_t result;
                 CHECK(msg->findInt32("result", &result));
 
-                ALOGI("PLAY completed with result %d (%s)",
+                ALOGI("PLAY (for seek) completed with result %d (%s)",
                      result, strerror(-result));
 
                 mCheckPending = false;
+                ++mCheckGeneration;
                 postAccessUnitTimeoutCheck();
 
                 if (result == OK) {
@@ -1301,10 +1297,7 @@ struct MyHandler : public AHandler {
 
                         // Post new timeout in order to make sure to use
                         // fake timestamps if no new Sender Reports arrive
-                        sp<AMessage> timeout = new AMessage('tiou', this);
-                        mCheckTimeoutGeneration++;
-                        timeout->setInt32("tioucheck", mCheckTimeoutGeneration);
-                        timeout->post(kStartupTimeoutUs);
+                        postTimeout();
 
                         ssize_t i = response->mHeaders.indexOfKey("rtp-info");
                         CHECK_GE(i, 0);
@@ -1322,6 +1315,12 @@ struct MyHandler : public AHandler {
 
                 mPausing = false;
                 mSeekPending = false;
+
+                // Discard all stale access units.
+                for (size_t i = 0; i < mTracks.size(); ++i) {
+                    TrackInfo *track = &mTracks.editItemAt(i);
+                    track->mPackets.clear();
+                }
 
                 sp<AMessage> msg = mNotify->dup();
                 msg->setInt32("what", kWhatSeekDone);
@@ -1396,6 +1395,11 @@ struct MyHandler : public AHandler {
         sp<AMessage> msg = new AMessage('aliv', this);
         msg->setInt32("generation", mKeepAliveGeneration);
         msg->post((mKeepAliveTimeoutUs * 9) / 10);
+    }
+
+    void cancelAccessUnitTimeoutCheck() {
+        ALOGV("cancelAccessUnitTimeoutCheck");
+        ++mCheckGeneration;
     }
 
     void postAccessUnitTimeoutCheck() {
@@ -1484,6 +1488,7 @@ struct MyHandler : public AHandler {
             TrackInfo *info = &mTracks.editItemAt(trackIndex);
             info->mFirstSeqNumInSegment = seq;
             info->mNewSegment = true;
+            info->mAllowedStaleAccessUnits = kMaxAllowedStaleAccessUnits;
 
             CHECK(GetAttribute((*it).c_str(), "rtptime", &val));
 
@@ -1527,6 +1532,7 @@ private:
         bool mUsingInterleavedTCP;
         uint32_t mFirstSeqNumInSegment;
         bool mNewSegment;
+        int32_t mAllowedStaleAccessUnits;
 
         uint32_t mRTPAnchor;
         int64_t mNTPAnchorUs;
@@ -1610,6 +1616,7 @@ private:
         info->mUsingInterleavedTCP = false;
         info->mFirstSeqNumInSegment = 0;
         info->mNewSegment = true;
+        info->mAllowedStaleAccessUnits = kMaxAllowedStaleAccessUnits;
         info->mRTPSocket = -1;
         info->mRTCPSocket = -1;
         info->mRTPAnchor = 0;
@@ -1779,14 +1786,8 @@ private:
 
             // Time is now established, lets start timestamping immediately
             for (size_t i = 0; i < mTracks.size(); ++i) {
-                TrackInfo *trackInfo = &mTracks.editItemAt(i);
-                while (!trackInfo->mPackets.empty()) {
-                    sp<ABuffer> accessUnit = *trackInfo->mPackets.begin();
-                    trackInfo->mPackets.erase(trackInfo->mPackets.begin());
-
-                    if (addMediaTimestamp(i, trackInfo, accessUnit)) {
-                        postQueueAccessUnit(i, accessUnit);
-                    }
+                if (OK != processAccessUnitQueue(i)) {
+                    return;
                 }
             }
             for (size_t i = 0; i < mTracks.size(); ++i) {
@@ -1799,38 +1800,83 @@ private:
         }
     }
 
-    void onAccessUnitComplete(
-            int32_t trackIndex, const sp<ABuffer> &accessUnit) {
-        ALOGV("onAccessUnitComplete track %d", trackIndex);
-
-        if(!mPlayResponseParsed){
-            ALOGI("play response is not parsed, storing accessunit");
-            TrackInfo *track = &mTracks.editItemAt(trackIndex);
-            track->mPackets.push_back(accessUnit);
-            return;
-        }
-
-        handleFirstAccessUnit();
-
+    status_t processAccessUnitQueue(int32_t trackIndex) {
         TrackInfo *track = &mTracks.editItemAt(trackIndex);
-
-        if (!mAllTracksHaveTime) {
-            ALOGV("storing accessUnit, no time established yet");
-            track->mPackets.push_back(accessUnit);
-            return;
-        }
-
         while (!track->mPackets.empty()) {
             sp<ABuffer> accessUnit = *track->mPackets.begin();
             track->mPackets.erase(track->mPackets.begin());
+
+            uint32_t seqNum = (uint32_t)accessUnit->int32Data();
+            if (track->mNewSegment) {
+                // The sequence number from RTP packet has only 16 bits and is extended
+                // by ARTPSource. Only the low 16 bits of seq in RTP-Info of reply of
+                // RTSP "PLAY" command should be used to detect the first RTP packet
+                // after seeking.
+                if (mSeekable) {
+                    if (track->mAllowedStaleAccessUnits > 0) {
+                        uint32_t seqNum16 = seqNum & 0xffff;
+                        uint32_t firstSeqNumInSegment16 = track->mFirstSeqNumInSegment & 0xffff;
+                        if (seqNum16 > firstSeqNumInSegment16 + kMaxAllowedStaleAccessUnits
+                                || seqNum16 < firstSeqNumInSegment16) {
+                            // Not the first rtp packet of the stream after seeking, discarding.
+                            track->mAllowedStaleAccessUnits--;
+                            ALOGV("discarding stale access unit (0x%x : 0x%x)",
+                                 seqNum, track->mFirstSeqNumInSegment);
+                            continue;
+                        }
+                        ALOGW_IF(seqNum16 != firstSeqNumInSegment16,
+                                "Missing the first packet(%u), now take packet(%u) as first one",
+                                track->mFirstSeqNumInSegment, seqNum);
+                    } else { // track->mAllowedStaleAccessUnits <= 0
+                        mNumAccessUnitsReceived = 0;
+                        ALOGW_IF(track->mAllowedStaleAccessUnits == 0,
+                             "Still no first rtp packet after %d stale ones",
+                             kMaxAllowedStaleAccessUnits);
+                        track->mAllowedStaleAccessUnits = -1;
+                        return UNKNOWN_ERROR;
+                    }
+                }
+
+                // Now found the first rtp packet of the stream after seeking.
+                track->mFirstSeqNumInSegment = seqNum;
+                track->mNewSegment = false;
+            }
+
+            if (seqNum < track->mFirstSeqNumInSegment) {
+                ALOGV("dropping stale access-unit (%d < %d)",
+                     seqNum, track->mFirstSeqNumInSegment);
+                continue;
+            }
 
             if (addMediaTimestamp(trackIndex, track, accessUnit)) {
                 postQueueAccessUnit(trackIndex, accessUnit);
             }
         }
+        return OK;
+    }
 
-        if (addMediaTimestamp(trackIndex, track, accessUnit)) {
-            postQueueAccessUnit(trackIndex, accessUnit);
+    void onAccessUnitComplete(
+            int32_t trackIndex, const sp<ABuffer> &accessUnit) {
+        TrackInfo *track = &mTracks.editItemAt(trackIndex);
+        track->mPackets.push_back(accessUnit);
+
+        uint32_t seqNum = (uint32_t)accessUnit->int32Data();
+        ALOGV("onAccessUnitComplete track %d storing accessunit %u", trackIndex, seqNum);
+
+        if(!mPlayResponseParsed){
+            ALOGV("play response is not parsed");
+            return;
+        }
+
+        handleFirstAccessUnit();
+
+        if (!mAllTracksHaveTime) {
+            ALOGV("storing accessUnit, no time established yet");
+            return;
+        }
+
+        if (OK != processAccessUnitQueue(trackIndex)) {
+            return;
         }
 
         if (track->mEOSReceived) {
@@ -1905,6 +1951,16 @@ private:
         msg->setInt32("rtpTime", rtpTime);
         msg->setInt64("nptUs", nptUs);
         msg->post();
+    }
+
+    void postTimeout() {
+        sp<AMessage> timeout = new AMessage('tiou', this);
+        mCheckTimeoutGeneration++;
+        timeout->setInt32("tioucheck", mCheckTimeoutGeneration);
+
+        int64_t startupTimeoutUs;
+        startupTimeoutUs = property_get_int64("media.rtsp.timeout-us", kStartupTimeoutUs);
+        timeout->post(startupTimeoutUs);
     }
 
     DISALLOW_EVIL_CONSTRUCTORS(MyHandler);

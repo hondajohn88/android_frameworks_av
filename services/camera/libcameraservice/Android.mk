@@ -20,13 +20,14 @@ LOCAL_PATH:= $(call my-dir)
 
 include $(CLEAR_VARS)
 
-LOCAL_SRC_FILES:=               \
+# Camera service source
+
+LOCAL_SRC_FILES :=  \
     CameraService.cpp \
-    CameraDeviceFactory.cpp \
     CameraFlashlight.cpp \
     common/Camera2ClientBase.cpp \
     common/CameraDeviceBase.cpp \
-    common/CameraModule.cpp \
+    common/CameraProviderManager.cpp \
     common/FrameProcessorBase.cpp \
     api1/CameraClient.cpp \
     api1/Camera2Client.cpp \
@@ -35,25 +36,26 @@ LOCAL_SRC_FILES:=               \
     api1/client2/StreamingProcessor.cpp \
     api1/client2/JpegProcessor.cpp \
     api1/client2/CallbackProcessor.cpp \
-    api1/client2/ZslProcessor.cpp \
-    api1/client2/ZslProcessorInterface.cpp \
-    api1/client2/BurstCapture.cpp \
     api1/client2/JpegCompressor.cpp \
     api1/client2/CaptureSequencer.cpp \
-    api1/client2/ZslProcessor3.cpp \
+    api1/client2/ZslProcessor.cpp \
     api2/CameraDeviceClient.cpp \
-    device2/Camera2Device.cpp \
+    device1/CameraHardwareInterface.cpp \
     device3/Camera3Device.cpp \
     device3/Camera3Stream.cpp \
     device3/Camera3IOStreamBase.cpp \
     device3/Camera3InputStream.cpp \
     device3/Camera3OutputStream.cpp \
-    device3/Camera3ZslStream.cpp \
     device3/Camera3DummyStream.cpp \
+    device3/Camera3SharedOutputStream.cpp \
     device3/StatusTracker.cpp \
+    device3/Camera3BufferManager.cpp \
+    device3/Camera3StreamSplitter.cpp \
     gui/RingBufferConsumer.cpp \
     utils/CameraTraces.cpp \
-    utils/AutoConditionLock.cpp
+    utils/AutoConditionLock.cpp \
+    utils/TagMonitor.cpp \
+    utils/LatencyHistogram.cpp
 
 LOCAL_SHARED_LIBRARIES:= \
     libui \
@@ -64,20 +66,39 @@ LOCAL_SHARED_LIBRARIES:= \
     libmedia \
     libmediautils \
     libcamera_client \
+    libcamera_metadata \
+    libfmq \
     libgui \
     libhardware \
-    libsync \
-    libcamera_metadata \
-    libjpeg
+    libhidlbase \
+    libhidltransport \
+    libjpeg \
+    libmemunreachable \
+    android.hardware.camera.common@1.0 \
+    android.hardware.camera.provider@2.4 \
+    android.hardware.camera.device@1.0 \
+    android.hardware.camera.device@3.2 \
+    android.hardware.camera.device@3.3
+
+ifeq ($(TARGET_USES_QTI_CAMERA_DEVICE), true)
+LOCAL_CFLAGS += -DQTI_CAMERA_DEVICE
+LOCAL_SHARED_LIBRARIES += \
+    vendor.qti.hardware.camera.device@1.0
+endif
+
+LOCAL_EXPORT_SHARED_LIBRARY_HEADERS := libbinder libcamera_client libfmq
 
 LOCAL_C_INCLUDES += \
-    system/media/camera/include \
     system/media/private/camera/include \
-    frameworks/native/include/media/openmax \
-    external/jpeg
+    frameworks/native/include/media/openmax
 
+LOCAL_EXPORT_C_INCLUDE_DIRS := \
+    frameworks/av/services/camera/libcameraservice
 
-LOCAL_CFLAGS += -Wall -Wextra
+LOCAL_CFLAGS += -Wall -Wextra -Werror
+
+# Workaround for invalid unused-lambda-capture warning http://b/38349491
+LOCAL_CLANG_CFLAGS += -Wno-error=unused-lambda-capture
 
 LOCAL_MODULE:= libcameraservice
 

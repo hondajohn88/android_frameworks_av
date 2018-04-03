@@ -23,12 +23,12 @@
 #include <media/stagefright/MediaDefs.h>
 #include <media/stagefright/MetaData.h>
 #include <OMX_IVCommon.h>
+#include <media/hardware/HardwareAPI.h>
 #include <media/hardware/MetadataBufferType.h>
 
 #include <ui/GraphicBuffer.h>
 #include <gui/BufferItem.h>
 #include <gui/ISurfaceComposer.h>
-#include <gui/IGraphicBufferAlloc.h>
 #include <OMX_Component.h>
 
 #include <utils/Log.h>
@@ -96,13 +96,13 @@ void SurfaceMediaSource::setFrameAvailableListener(
     mFrameAvailableListener = listener;
 }
 
-void SurfaceMediaSource::dump(String8& result) const
+void SurfaceMediaSource::dumpState(String8& result) const
 {
     char buffer[1024];
-    dump(result, "", buffer, 1024);
+    dumpState(result, "", buffer, 1024);
 }
 
-void SurfaceMediaSource::dump(
+void SurfaceMediaSource::dumpState(
         String8& result,
         const char* /* prefix */,
         char* buffer,
@@ -111,7 +111,7 @@ void SurfaceMediaSource::dump(
     Mutex::Autolock lock(mMutex);
 
     result.append(buffer);
-    mConsumer->dump(result, "");
+    mConsumer->dumpState(result, "");
 }
 
 status_t SurfaceMediaSource::setFrameRate(int32_t fps)
@@ -126,9 +126,9 @@ status_t SurfaceMediaSource::setFrameRate(int32_t fps)
     return OK;
 }
 
-bool SurfaceMediaSource::isMetaDataStoredInVideoBuffers() const {
+MetadataBufferType SurfaceMediaSource::metaDataStoredInVideoBuffers() const {
     ALOGV("isMetaDataStoredInVideoBuffers");
-    return true;
+    return kMetadataBufferTypeANWBuffer;
 }
 
 int32_t SurfaceMediaSource::getFrameRate( ) const {
@@ -166,7 +166,7 @@ status_t SurfaceMediaSource::start(MetaData *params)
         mMaxAcquiredBufferCount = bufferCount;
     }
 
-    CHECK_GT(mMaxAcquiredBufferCount, 1);
+    CHECK_GT(mMaxAcquiredBufferCount, 1u);
 
     status_t err =
         mConsumer->setMaxAcquiredBufferCount(mMaxAcquiredBufferCount);
@@ -185,7 +185,7 @@ status_t SurfaceMediaSource::setMaxAcquiredBufferCount(size_t count) {
     ALOGV("setMaxAcquiredBufferCount(%zu)", count);
     Mutex::Autolock lock(mMutex);
 
-    CHECK_GT(count, 1);
+    CHECK_GT(count, 1u);
     mMaxAcquiredBufferCount = count;
 
     return OK;
@@ -250,29 +250,19 @@ sp<MetaData> SurfaceMediaSource::getFormat()
 }
 
 // Pass the data to the MediaBuffer. Pass in only the metadata
-// The metadata passed consists of two parts:
-// 1. First, there is an integer indicating that it is a GRAlloc
-// source (kMetadataBufferTypeGrallocSource)
-// 2. This is followed by the buffer_handle_t that is a handle to the
-// GRalloc buffer. The encoder needs to interpret this GRalloc handle
-// and encode the frames.
-// --------------------------------------------------------------
-// |  kMetadataBufferTypeGrallocSource | sizeof(buffer_handle_t) |
-// --------------------------------------------------------------
 // Note: Call only when you have the lock
-static void passMetadataBuffer(MediaBuffer **buffer,
-        buffer_handle_t bufferHandle) {
-    *buffer = new MediaBuffer(4 + sizeof(buffer_handle_t));
-    char *data = (char *)(*buffer)->data();
+void SurfaceMediaSource::passMetadataBuffer_l(MediaBuffer **buffer,
+        ANativeWindowBuffer *bufferHandle) const {
+    *buffer = new MediaBuffer(sizeof(VideoNativeMetadata));
+    VideoNativeMetadata *data = (VideoNativeMetadata *)(*buffer)->data();
     if (data == NULL) {
         ALOGE("Cannot allocate memory for metadata buffer!");
         return;
     }
-    OMX_U32 type = kMetadataBufferTypeGrallocSource;
-    memcpy(data, &type, 4);
-    memcpy(data + 4, &bufferHandle, sizeof(buffer_handle_t));
-
-    ALOGV("handle = %p, , offset = %zu, length = %zu",
+    data->eType = metaDataStoredInVideoBuffers();
+    data->pBuffer = bufferHandle;
+    data->nFenceFd = -1;
+    ALOGV("handle = %p, offset = %zu, length = %zu",
             bufferHandle, (*buffer)->range_length(), (*buffer)->range_offset());
 }
 
@@ -308,9 +298,9 @@ status_t SurfaceMediaSource::read(
 
             // First time seeing the buffer?  Added it to the SMS slot
             if (item.mGraphicBuffer != NULL) {
-                mSlots[item.mBuf].mGraphicBuffer = item.mGraphicBuffer;
+                mSlots[item.mSlot].mGraphicBuffer = item.mGraphicBuffer;
             }
-            mSlots[item.mBuf].mFrameNumber = item.mFrameNumber;
+            mSlots[item.mSlot].mFrameNumber = item.mFrameNumber;
 
             // check for the timing of this buffer
             if (mNumFramesReceived == 0 && !mUseAbsoluteTimestamps) {
@@ -320,7 +310,7 @@ status_t SurfaceMediaSource::read(
                     if (item.mTimestamp < mStartTimeNs) {
                         // This frame predates start of record, discard
                         mConsumer->releaseBuffer(
-                                item.mBuf, item.mFrameNumber, EGL_NO_DISPLAY,
+                                item.mSlot, item.mFrameNumber, EGL_NO_DISPLAY,
                                 EGL_NO_SYNC_KHR, Fence::NO_FENCE);
                         continue;
                     }
@@ -346,13 +336,13 @@ status_t SurfaceMediaSource::read(
         return ERROR_END_OF_STREAM;
     }
 
-    mCurrentSlot = item.mBuf;
+    mCurrentSlot = item.mSlot;
 
     // First time seeing the buffer?  Added it to the SMS slot
     if (item.mGraphicBuffer != NULL) {
-        mSlots[item.mBuf].mGraphicBuffer = item.mGraphicBuffer;
+        mSlots[item.mSlot].mGraphicBuffer = item.mGraphicBuffer;
     }
-    mSlots[item.mBuf].mFrameNumber = item.mFrameNumber;
+    mSlots[item.mSlot].mFrameNumber = item.mFrameNumber;
 
     mCurrentBuffers.push_back(mSlots[mCurrentSlot].mGraphicBuffer);
     int64_t prevTimeStamp = mCurrentTimestamp;
@@ -361,7 +351,7 @@ status_t SurfaceMediaSource::read(
     mNumFramesEncoded++;
     // Pass the data to the MediaBuffer. Pass in only the metadata
 
-    passMetadataBuffer(buffer, mSlots[mCurrentSlot].mGraphicBuffer->handle);
+    passMetadataBuffer_l(buffer, mSlots[mCurrentSlot].mGraphicBuffer->getNativeBuffer());
 
     (*buffer)->setObserver(this);
     (*buffer)->add_ref();
@@ -399,7 +389,7 @@ void SurfaceMediaSource::signalBufferReturned(MediaBuffer *buffer) {
     buffer_handle_t bufferHandle = getMediaBufferHandle(buffer);
 
     for (size_t i = 0; i < mCurrentBuffers.size(); i++) {
-        if (mCurrentBuffers[i]->handle == bufferHandle) {
+        if ((buffer_handle_t)mCurrentBuffers[i]->getNativeBuffer() == bufferHandle) {
             mCurrentBuffers.removeAt(i);
             foundBuffer = true;
             break;
@@ -415,7 +405,7 @@ void SurfaceMediaSource::signalBufferReturned(MediaBuffer *buffer) {
             continue;
         }
 
-        if (bufferHandle == mSlots[id].mGraphicBuffer->handle) {
+        if (bufferHandle == (buffer_handle_t)mSlots[id].mGraphicBuffer->getNativeBuffer()) {
             ALOGV("Slot %d returned, matches handle = %p", id,
                     mSlots[id].mGraphicBuffer->handle);
 

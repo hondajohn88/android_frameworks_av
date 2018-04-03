@@ -30,7 +30,7 @@
 
 namespace android {
 
-AACEncoder::AACEncoder(const sp<MediaSource> &source, const sp<MetaData> &meta)
+AACEncoder::AACEncoder(const sp<IMediaSource> &source, const sp<MetaData> &meta)
     : mSource(source),
       mMeta(meta),
       mStarted(false),
@@ -296,7 +296,7 @@ status_t AACEncoder::read(
     memset(&inputData, 0, sizeof(inputData));
     inputData.Buffer = (unsigned char*) mInputFrame;
     inputData.Length = nSamples * sizeof(int16_t);
-    CHECK(VO_ERR_NONE == mApiHandle->SetInputData(mEncoderHandle,&inputData));
+    CHECK((VO_U32)VO_ERR_NONE == mApiHandle->SetInputData(mEncoderHandle,&inputData));
 
     VO_CODECBUFFER outputData;
     memset(&outputData, 0, sizeof(outputData));

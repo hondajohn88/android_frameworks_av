@@ -29,13 +29,14 @@ class FLACExtractor : public MediaExtractor {
 
 public:
     // Extractor assumes ownership of source
-    FLACExtractor(const sp<DataSource> &source);
+    explicit FLACExtractor(const sp<DataSource> &source);
 
     virtual size_t countTracks();
-    virtual sp<MediaSource> getTrack(size_t index);
+    virtual sp<IMediaSource> getTrack(size_t index);
     virtual sp<MetaData> getTrackMetaData(size_t index, uint32_t flags);
 
     virtual sp<MetaData> getMetaData();
+    virtual const char * name() { return "FLACExtractor"; }
 
 protected:
     virtual ~FLACExtractor();

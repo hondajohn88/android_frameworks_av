@@ -19,7 +19,7 @@
 #include <utils/RefBase.h>
 #include <media/AudioPolicy.h>
 #include <utils/KeyedVector.h>
-#include <hardware/audio.h>
+#include <system/audio.h>
 #include <utils/String8.h>
 
 namespace android {
@@ -43,6 +43,8 @@ public:
 
     void setMix(AudioMix &mix);
 
+    status_t dump(int fd, int spaces, int index) const;
+
 private:
     AudioMix    mMix;                   // Audio policy mix descriptor
     sp<SwAudioOutputDescriptor> mOutput;  // Corresponding output stream
@@ -52,11 +54,11 @@ private:
 class AudioPolicyMixCollection : public DefaultKeyedVector<String8, sp<AudioPolicyMix> >
 {
 public:
-    status_t getAudioPolicyMix(String8 address, sp<AudioPolicyMix> &policyMix) const;
+    status_t getAudioPolicyMix(const String8& address, sp<AudioPolicyMix> &policyMix) const;
 
-    status_t registerMix(String8 address, AudioMix mix);
+    status_t registerMix(const String8& address, AudioMix mix, sp<SwAudioOutputDescriptor> desc);
 
-    status_t unregisterMix(String8 address);
+    status_t unregisterMix(const String8& address);
 
     void closeOutput(sp<SwAudioOutputDescriptor> &desc);
 
@@ -69,13 +71,16 @@ public:
      * @return NO_ERROR if an output was found for the given attribute (in this case, the
      *                  descriptor output param is initialized), error code otherwise.
      */
-    status_t getOutputForAttr(audio_attributes_t attributes, sp<SwAudioOutputDescriptor> &desc);
+    status_t getOutputForAttr(audio_attributes_t attributes, uid_t uid,
+            sp<SwAudioOutputDescriptor> &desc);
 
     audio_devices_t getDeviceAndMixForInputSource(audio_source_t inputSource,
                                                   audio_devices_t availableDeviceTypes,
                                                   AudioMix **policyMix);
 
     status_t getInputMixForAttr(audio_attributes_t attr, AudioMix **policyMix);
+
+    status_t dump(int fd) const;
 };
 
 }; // namespace android

@@ -20,17 +20,48 @@
 
 #include <media/IMediaRecorder.h>
 
+#include <android/hardware/media/omx/1.0/IOmx.h>
+
 namespace android {
 
-class MediaRecorderBase;
+struct MediaRecorderBase;
 class MediaPlayerService;
 class ICameraRecordingProxy;
-class IGraphicBufferProducer;
 
 class MediaRecorderClient : public BnMediaRecorder
 {
+    typedef ::android::hardware::media::omx::V1_0::IOmx IOmx;
+
+    class ServiceDeathNotifier :
+            public IBinder::DeathRecipient,
+            public ::android::hardware::hidl_death_recipient
+    {
+    public:
+        ServiceDeathNotifier(
+                const sp<IBinder>& service,
+                const sp<IMediaRecorderClient>& listener,
+                int which);
+        ServiceDeathNotifier(
+                const sp<IOmx>& omx,
+                const sp<IMediaRecorderClient>& listener,
+                int which);
+        virtual ~ServiceDeathNotifier();
+        virtual void binderDied(const wp<IBinder>& who);
+        virtual void serviceDied(
+                uint64_t cookie,
+                const wp<::android::hidl::base::V1_0::IBase>& who);
+        void unlinkToDeath();
+    private:
+        int mWhich;
+        sp<IBinder> mService;
+        sp<IOmx> mOmx;
+        wp<IMediaRecorderClient> mListener;
+    };
+
+    void clearDeathNotifiers_l();
+
 public:
-    virtual     status_t   setCamera(const sp<ICamera>& camera,
+    virtual     status_t   setCamera(const sp<hardware::ICamera>& camera,
                                     const sp<ICameraRecordingProxy>& proxy);
     virtual     status_t   setPreviewSurface(const sp<IGraphicBufferProducer>& surface);
     virtual     status_t   setVideoSource(int vs);
@@ -38,8 +69,8 @@ public:
     virtual     status_t   setOutputFormat(int of);
     virtual     status_t   setVideoEncoder(int ve);
     virtual     status_t   setAudioEncoder(int ae);
-    virtual     status_t   setOutputFile(int fd, int64_t offset,
-                                                  int64_t length);
+    virtual     status_t   setOutputFile(int fd);
+    virtual     status_t   setNextOutputFile(int fd);
     virtual     status_t   setVideoSize(int width, int height);
     virtual     status_t   setVideoFrameRate(int frames_per_second);
     virtual     status_t   setParameters(const String8& params);
@@ -48,14 +79,17 @@ public:
     virtual     status_t   setClientName(const String16& clientName);
     virtual     status_t   prepare();
     virtual     status_t   getMaxAmplitude(int* max);
+    virtual     status_t   getMetrics(Parcel* reply);
     virtual     status_t   start();
     virtual     status_t   stop();
     virtual     status_t   reset();
+    virtual     status_t   pause();
+    virtual     status_t   resume();
     virtual     status_t   init();
     virtual     status_t   close();
     virtual     status_t   release();
     virtual     status_t   dump(int fd, const Vector<String16>& args);
-    virtual     status_t   setInputSurface(const sp<IGraphicBufferConsumer>& surface);
+    virtual     status_t   setInputSurface(const sp<PersistentSurface>& surface);
     virtual     sp<IGraphicBufferProducer> querySurfaceMediaSource();
 
 private:
@@ -66,6 +100,9 @@ private:
                                                                pid_t pid,
                                                                const String16& opPackageName);
     virtual                ~MediaRecorderClient();
+
+    sp<ServiceDeathNotifier> mCameraDeathListener;
+    sp<ServiceDeathNotifier> mCodecDeathListener;
 
     pid_t                  mPid;
     Mutex                  mLock;

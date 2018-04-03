@@ -33,7 +33,7 @@
 #include "DrmManager.h"
 #include "ReadWriteUtils.h"
 
-#define DECRYPT_FILE_ERROR -1
+#define DECRYPT_FILE_ERROR (-1)
 
 using namespace android;
 
@@ -88,14 +88,9 @@ void DrmManager::removeUniqueId(int uniqueId) {
 }
 
 status_t DrmManager::loadPlugIns() {
-
-    String8 vendorPluginDirPath("/vendor/lib/drm");
-    loadPlugIns(vendorPluginDirPath);
-
     String8 pluginDirPath("/system/lib/drm");
     loadPlugIns(pluginDirPath);
     return DRM_NO_ERROR;
-
 }
 
 status_t DrmManager::loadPlugIns(const String8& plugInDirPath) {
@@ -370,7 +365,7 @@ DrmConvertedStatus* DrmManager::closeConvertSession(int uniqueId, int convertId)
 }
 
 status_t DrmManager::getAllSupportInfo(
-                    int uniqueId, int* length, DrmSupportInfo** drmSupportInfoArray) {
+                    int /* uniqueId */, int* length, DrmSupportInfo** drmSupportInfoArray) {
     Mutex::Autolock _l(mLock);
     Vector<String8> plugInPathList = mPlugInManager.getPlugInIdList();
     int size = plugInPathList.size();
@@ -413,7 +408,7 @@ DecryptHandle* DrmManager::openDecryptSession(
         handle->decryptId = mDecryptSessionId + 1;
 
         for (size_t index = 0; index < plugInIdList.size(); index++) {
-            String8 plugInId = plugInIdList.itemAt(index);
+            const String8& plugInId = plugInIdList.itemAt(index);
             IDrmEngine& rDrmEngine = mPlugInManager.getPlugIn(plugInId);
             result = rDrmEngine.openDecryptSession(uniqueId, handle, fd, offset, length, mime);
 
@@ -441,7 +436,7 @@ DecryptHandle* DrmManager::openDecryptSession(
         handle->decryptId = mDecryptSessionId + 1;
 
         for (size_t index = 0; index < plugInIdList.size(); index++) {
-            String8 plugInId = plugInIdList.itemAt(index);
+            const String8& plugInId = plugInIdList.itemAt(index);
             IDrmEngine& rDrmEngine = mPlugInManager.getPlugIn(plugInId);
             result = rDrmEngine.openDecryptSession(uniqueId, handle, uri, mime);
 
@@ -470,7 +465,7 @@ DecryptHandle* DrmManager::openDecryptSession(
         handle->decryptId = mDecryptSessionId + 1;
 
         for (size_t index = 0; index < plugInIdList.size(); index++) {
-            String8 plugInId = plugInIdList.itemAt(index);
+            const String8& plugInId = plugInIdList.itemAt(index);
             IDrmEngine& rDrmEngine = mPlugInManager.getPlugIn(plugInId);
             result = rDrmEngine.openDecryptSession(uniqueId, handle, buf, mimeType);
 

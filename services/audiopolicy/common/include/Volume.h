@@ -30,6 +30,17 @@ public:
     float mDBAttenuation;
 };
 
+/**
+ * device categories used for volume curve management.
+ */
+enum device_category {
+    DEVICE_CATEGORY_HEADSET,
+    DEVICE_CATEGORY_SPEAKER,
+    DEVICE_CATEGORY_EARPIECE,
+    DEVICE_CATEGORY_EXT_MEDIA,
+    DEVICE_CATEGORY_CNT
+};
+
 class Volume
 {
 public:
@@ -47,17 +58,6 @@ public:
         VOLMAX = 3,
 
         VOLCNT = 4
-    };
-
-    /**
-     * device categories used for volume curve management.
-     */
-    enum device_category {
-        DEVICE_CATEGORY_HEADSET,
-        DEVICE_CATEGORY_SPEAKER,
-        DEVICE_CATEGORY_EARPIECE,
-        DEVICE_CATEGORY_EXT_MEDIA,
-        DEVICE_CATEGORY_CNT
     };
 
     /**
@@ -124,16 +124,16 @@ public:
         case AUDIO_DEVICE_OUT_BLUETOOTH_SCO_HEADSET:
         case AUDIO_DEVICE_OUT_BLUETOOTH_A2DP:
         case AUDIO_DEVICE_OUT_BLUETOOTH_A2DP_HEADPHONES:
+        case AUDIO_DEVICE_OUT_USB_HEADSET:
             return DEVICE_CATEGORY_HEADSET;
         case AUDIO_DEVICE_OUT_LINE:
         case AUDIO_DEVICE_OUT_AUX_DIGITAL:
-            /*USB?  Remote submix?*/
+        case AUDIO_DEVICE_OUT_USB_DEVICE:
             return DEVICE_CATEGORY_EXT_MEDIA;
         case AUDIO_DEVICE_OUT_SPEAKER:
         case AUDIO_DEVICE_OUT_BLUETOOTH_SCO_CARKIT:
         case AUDIO_DEVICE_OUT_BLUETOOTH_A2DP_SPEAKER:
         case AUDIO_DEVICE_OUT_USB_ACCESSORY:
-        case AUDIO_DEVICE_OUT_USB_DEVICE:
         case AUDIO_DEVICE_OUT_REMOTE_SUBMIX:
         default:
             return DEVICE_CATEGORY_SPEAKER;

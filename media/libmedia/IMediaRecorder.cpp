@@ -23,11 +23,13 @@
 
 #include <utils/Log.h>
 #include <binder/Parcel.h>
-#include <camera/ICamera.h>
+#include <camera/android/hardware/ICamera.h>
+#include <camera/ICameraRecordingProxy.h>
 #include <media/IMediaRecorderClient.h>
 #include <media/IMediaRecorder.h>
 #include <gui/Surface.h>
 #include <gui/IGraphicBufferProducer.h>
+#include <media/stagefright/PersistentSurface.h>
 
 namespace android {
 
@@ -48,24 +50,29 @@ enum {
     SET_VIDEO_ENCODER,
     SET_AUDIO_ENCODER,
     SET_OUTPUT_FILE_FD,
+    SET_NEXT_OUTPUT_FILE_FD,
     SET_VIDEO_SIZE,
     SET_VIDEO_FRAMERATE,
     SET_PARAMETERS,
     SET_PREVIEW_SURFACE,
     SET_CAMERA,
     SET_LISTENER,
-    SET_CLIENT_NAME
+    SET_CLIENT_NAME,
+    PAUSE,
+    RESUME,
+    GET_METRICS,
+
 };
 
 class BpMediaRecorder: public BpInterface<IMediaRecorder>
 {
 public:
-    BpMediaRecorder(const sp<IBinder>& impl)
+    explicit BpMediaRecorder(const sp<IBinder>& impl)
     : BpInterface<IMediaRecorder>(impl)
     {
     }
 
-    status_t setCamera(const sp<ICamera>& camera, const sp<ICameraRecordingProxy>& proxy)
+    status_t setCamera(const sp<hardware::ICamera>& camera, const sp<ICameraRecordingProxy>& proxy)
     {
         ALOGV("setCamera(%p,%p)", camera.get(), proxy.get());
         Parcel data, reply;
@@ -76,12 +83,12 @@ public:
         return reply.readInt32();
     }
 
-    status_t setInputSurface(const sp<IGraphicBufferConsumer>& surface)
+    status_t setInputSurface(const sp<PersistentSurface>& surface)
     {
         ALOGV("setInputSurface(%p)", surface.get());
         Parcel data, reply;
         data.writeInterfaceToken(IMediaRecorder::getInterfaceDescriptor());
-        data.writeStrongBinder(IInterface::asBinder(surface));
+        surface->writeToParcel(&data);
         remote()->transact(SET_INPUT_SURFACE, data, &reply);
         return reply.readInt32();
     }
@@ -168,14 +175,21 @@ public:
         return reply.readInt32();
     }
 
-    status_t setOutputFile(int fd, int64_t offset, int64_t length) {
-        ALOGV("setOutputFile(%d, %" PRId64 ", %" PRId64 ")", fd, offset, length);
+    status_t setOutputFile(int fd) {
+        ALOGV("setOutputFile(%d)", fd);
         Parcel data, reply;
         data.writeInterfaceToken(IMediaRecorder::getInterfaceDescriptor());
         data.writeFileDescriptor(fd);
-        data.writeInt64(offset);
-        data.writeInt64(length);
         remote()->transact(SET_OUTPUT_FILE_FD, data, &reply);
+        return reply.readInt32();
+    }
+
+    status_t setNextOutputFile(int fd) {
+        ALOGV("setNextOutputFile(%d)", fd);
+        Parcel data, reply;
+        data.writeInterfaceToken(IMediaRecorder::getInterfaceDescriptor());
+        data.writeFileDescriptor(fd);
+        remote()->transact(SET_NEXT_OUTPUT_FILE_FD, data, &reply);
         return reply.readInt32();
     }
 
@@ -249,6 +263,18 @@ public:
         return reply.readInt32();
     }
 
+    status_t getMetrics(Parcel* reply)
+    {
+        ALOGV("getMetrics");
+        Parcel data;
+        data.writeInterfaceToken(IMediaRecorder::getInterfaceDescriptor());
+        status_t ret = remote()->transact(GET_METRICS, data, reply);
+        if (ret == NO_ERROR) {
+            return OK;
+        }
+        return UNKNOWN_ERROR;
+    }
+
     status_t start()
     {
         ALOGV("start");
@@ -273,6 +299,24 @@ public:
         Parcel data, reply;
         data.writeInterfaceToken(IMediaRecorder::getInterfaceDescriptor());
         remote()->transact(RESET, data, &reply);
+        return reply.readInt32();
+    }
+
+    status_t pause()
+    {
+        ALOGV("pause");
+        Parcel data, reply;
+        data.writeInterfaceToken(IMediaRecorder::getInterfaceDescriptor());
+        remote()->transact(PAUSE, data, &reply);
+        return reply.readInt32();
+    }
+
+    status_t resume()
+    {
+        ALOGV("resume");
+        Parcel data, reply;
+        data.writeInterfaceToken(IMediaRecorder::getInterfaceDescriptor());
+        remote()->transact(RESUME, data, &reply);
         return reply.readInt32();
     }
 
@@ -340,6 +384,18 @@ status_t BnMediaRecorder::onTransact(
             reply->writeInt32(start());
             return NO_ERROR;
         } break;
+        case PAUSE: {
+            ALOGV("PAUSE");
+            CHECK_INTERFACE(IMediaRecorder, data, reply);
+            reply->writeInt32(pause());
+            return NO_ERROR;
+        } break;
+        case RESUME: {
+            ALOGV("RESUME");
+            CHECK_INTERFACE(IMediaRecorder, data, reply);
+            reply->writeInt32(resume());
+            return NO_ERROR;
+        } break;
         case PREPARE: {
             ALOGV("PREPARE");
             CHECK_INTERFACE(IMediaRecorder, data, reply);
@@ -354,6 +410,11 @@ status_t BnMediaRecorder::onTransact(
             reply->writeInt32(max);
             reply->writeInt32(ret);
             return NO_ERROR;
+        } break;
+        case GET_METRICS: {
+            ALOGV("GET_METRICS");
+            status_t ret = getMetrics(reply);
+            return ret;
         } break;
         case SET_VIDEO_SOURCE: {
             ALOGV("SET_VIDEO_SOURCE");
@@ -395,9 +456,15 @@ status_t BnMediaRecorder::onTransact(
             ALOGV("SET_OUTPUT_FILE_FD");
             CHECK_INTERFACE(IMediaRecorder, data, reply);
             int fd = dup(data.readFileDescriptor());
-            int64_t offset = data.readInt64();
-            int64_t length = data.readInt64();
-            reply->writeInt32(setOutputFile(fd, offset, length));
+            reply->writeInt32(setOutputFile(fd));
+            ::close(fd);
+            return NO_ERROR;
+        } break;
+        case SET_NEXT_OUTPUT_FILE_FD: {
+            ALOGV("SET_NEXT_OUTPUT_FILE_FD");
+            CHECK_INTERFACE(IMediaRecorder, data, reply);
+            int fd = dup(data.readFileDescriptor());
+            reply->writeInt32(setNextOutputFile(fd));
             ::close(fd);
             return NO_ERROR;
         } break;
@@ -447,17 +514,18 @@ status_t BnMediaRecorder::onTransact(
         case SET_CAMERA: {
             ALOGV("SET_CAMERA");
             CHECK_INTERFACE(IMediaRecorder, data, reply);
-            sp<ICamera> camera = interface_cast<ICamera>(data.readStrongBinder());
+            sp<hardware::ICamera> camera =
+                    interface_cast<hardware::ICamera>(data.readStrongBinder());
             sp<ICameraRecordingProxy> proxy =
-                interface_cast<ICameraRecordingProxy>(data.readStrongBinder());
+                    interface_cast<ICameraRecordingProxy>(data.readStrongBinder());
             reply->writeInt32(setCamera(camera, proxy));
             return NO_ERROR;
         } break;
         case SET_INPUT_SURFACE: {
             ALOGV("SET_INPUT_SURFACE");
             CHECK_INTERFACE(IMediaRecorder, data, reply);
-            sp<IGraphicBufferConsumer> surface = interface_cast<IGraphicBufferConsumer>(
-                    data.readStrongBinder());
+            sp<PersistentSurface> surface = new PersistentSurface();
+            surface->readFromParcel(&data);
             reply->writeInt32(setInputSurface(surface));
             return NO_ERROR;
         } break;

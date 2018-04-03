@@ -27,8 +27,8 @@
 #include <media/stagefright/MediaDefs.h>
 #include <media/stagefright/MediaErrors.h>
 #include <media/stagefright/MetaData.h>
-#include <media/stagefright/Utils.h>
-#include <ui/Rect.h>
+#include <OMX_IndexExt.h>
+#include <OMX_VideoExt.h>
 
 #include "ih264_typedefs.h"
 #include "iv2.h"
@@ -74,33 +74,11 @@ static LevelConversion ConversionTable[] = {
 };
 
 static const CodecProfileLevel kProfileLevels[] = {
-    { OMX_VIDEO_AVCProfileBaseline, OMX_VIDEO_AVCLevel1  },
-    { OMX_VIDEO_AVCProfileBaseline, OMX_VIDEO_AVCLevel1b },
-    { OMX_VIDEO_AVCProfileBaseline, OMX_VIDEO_AVCLevel11 },
-    { OMX_VIDEO_AVCProfileBaseline, OMX_VIDEO_AVCLevel12 },
-    { OMX_VIDEO_AVCProfileBaseline, OMX_VIDEO_AVCLevel13 },
-    { OMX_VIDEO_AVCProfileBaseline, OMX_VIDEO_AVCLevel2  },
-    { OMX_VIDEO_AVCProfileBaseline, OMX_VIDEO_AVCLevel21 },
-    { OMX_VIDEO_AVCProfileBaseline, OMX_VIDEO_AVCLevel22 },
-    { OMX_VIDEO_AVCProfileBaseline, OMX_VIDEO_AVCLevel3  },
-    { OMX_VIDEO_AVCProfileBaseline, OMX_VIDEO_AVCLevel31 },
-    { OMX_VIDEO_AVCProfileBaseline, OMX_VIDEO_AVCLevel32 },
-    { OMX_VIDEO_AVCProfileBaseline, OMX_VIDEO_AVCLevel4  },
-    { OMX_VIDEO_AVCProfileBaseline, OMX_VIDEO_AVCLevel41 },
-    { OMX_VIDEO_AVCProfileMain, OMX_VIDEO_AVCLevel1  },
-    { OMX_VIDEO_AVCProfileMain, OMX_VIDEO_AVCLevel1b },
-    { OMX_VIDEO_AVCProfileMain, OMX_VIDEO_AVCLevel11 },
-    { OMX_VIDEO_AVCProfileMain, OMX_VIDEO_AVCLevel12 },
-    { OMX_VIDEO_AVCProfileMain, OMX_VIDEO_AVCLevel13 },
-    { OMX_VIDEO_AVCProfileMain, OMX_VIDEO_AVCLevel2  },
-    { OMX_VIDEO_AVCProfileMain, OMX_VIDEO_AVCLevel21 },
-    { OMX_VIDEO_AVCProfileMain, OMX_VIDEO_AVCLevel22 },
-    { OMX_VIDEO_AVCProfileMain, OMX_VIDEO_AVCLevel3  },
-    { OMX_VIDEO_AVCProfileMain, OMX_VIDEO_AVCLevel31 },
-    { OMX_VIDEO_AVCProfileMain, OMX_VIDEO_AVCLevel32 },
-    { OMX_VIDEO_AVCProfileMain, OMX_VIDEO_AVCLevel4  },
-    { OMX_VIDEO_AVCProfileMain, OMX_VIDEO_AVCLevel41 },
+    { OMX_VIDEO_AVCProfileConstrainedBaseline, OMX_VIDEO_AVCLevel41 },
 
+    { OMX_VIDEO_AVCProfileBaseline, OMX_VIDEO_AVCLevel41 },
+
+    { OMX_VIDEO_AVCProfileMain, OMX_VIDEO_AVCLevel41 },
 };
 
 static size_t GetCPUCoreCount() {
@@ -157,8 +135,7 @@ SoftAVC::SoftAVC(
             kProfileLevels, NELEM(kProfileLevels),
             176 /* width */, 144 /* height */,
             callbacks, appData, component),
-      mBitrateUpdated(false),
-      mKeyFrameRequested(false),
+      mUpdateFlag(0),
       mIvVideoColorFormat(IV_YUV_420P),
       mAVCEncProfile(IV_PROFILE_BASE),
       mAVCEncLevel(41),
@@ -207,6 +184,7 @@ void  SoftAVC::initEncParams() {
     mEnableAltRef = DEFAULT_ENABLE_ALT_REF;
     mEncSpeed = DEFAULT_ENC_SPEED;
     mIntra4x4 = DEFAULT_INTRA4x4;
+    mConstrainedIntraFlag = DEFAULT_CONSTRAINED_INTRA;
     mAIRMode = DEFAULT_AIR;
     mAIRRefreshPeriod = DEFAULT_AIR_REFRESH_PERIOD;
     mPSNREnable = DEFAULT_PSNR_ENABLE;
@@ -304,6 +282,7 @@ OMX_ERRORTYPE SoftAVC::setIpeParams() {
 
     s_ipe_params_ip.u4_enable_intra_4x4 = mIntra4x4;
     s_ipe_params_ip.u4_enc_speed_preset = mEncSpeed;
+    s_ipe_params_ip.u4_constrained_intra_pred = mConstrainedIntraFlag;
 
     s_ipe_params_ip.u4_timestamp_high = -1;
     s_ipe_params_ip.u4_timestamp_low = -1;
@@ -611,6 +590,7 @@ OMX_ERRORTYPE SoftAVC::initEncoder() {
     IV_STATUS_T status;
     WORD32 level;
     uint32_t displaySizeY;
+
     CHECK(!mStarted);
 
     OMX_ERRORTYPE errType = OMX_ErrorNone;
@@ -626,8 +606,10 @@ OMX_ERRORTYPE SoftAVC::initEncoder() {
         level = 30;
     } else if (displaySizeY > (352 * 288)) {
         level = 21;
-    } else {
+    } else if (displaySizeY > (176 * 144)) {
         level = 20;
+    } else {
+        level = 10;
     }
     mAVCEncLevel = MAX(level, mAVCEncLevel);
 
@@ -914,6 +896,9 @@ OMX_ERRORTYPE SoftAVC::releaseEncoder() {
         }
     }
 
+    // clear other pointers into the space being free()d
+    mCodecCtx = NULL;
+
     mStarted = false;
 
     return OMX_ErrorNone;
@@ -925,6 +910,10 @@ OMX_ERRORTYPE SoftAVC::internalGetParameter(OMX_INDEXTYPE index, OMX_PTR params)
         {
             OMX_VIDEO_PARAM_BITRATETYPE *bitRate =
                 (OMX_VIDEO_PARAM_BITRATETYPE *)params;
+
+            if (!isValidOMXParam(bitRate)) {
+                return OMX_ErrorBadParameter;
+            }
 
             if (bitRate->nPortIndex != 1) {
                 return OMX_ErrorUndefined;
@@ -939,6 +928,10 @@ OMX_ERRORTYPE SoftAVC::internalGetParameter(OMX_INDEXTYPE index, OMX_PTR params)
         {
             OMX_VIDEO_PARAM_AVCTYPE *avcParams = (OMX_VIDEO_PARAM_AVCTYPE *)params;
 
+            if (!isValidOMXParam(avcParams)) {
+                return OMX_ErrorBadParameter;
+            }
+
             if (avcParams->nPortIndex != 1) {
                 return OMX_ErrorUndefined;
             }
@@ -949,7 +942,8 @@ OMX_ERRORTYPE SoftAVC::internalGetParameter(OMX_INDEXTYPE index, OMX_PTR params)
                 return OMX_ErrorUndefined;
             }
 
-            avcParams->eProfile = OMX_VIDEO_AVCProfileBaseline;
+            // TODO: maintain profile
+            avcParams->eProfile = (OMX_VIDEO_AVCPROFILETYPE)OMX_VIDEO_AVCProfileConstrainedBaseline;
             avcParams->eLevel = omxLevel;
             avcParams->nRefFrames = 1;
             avcParams->bUseHadamard = OMX_TRUE;
@@ -976,13 +970,23 @@ OMX_ERRORTYPE SoftAVC::internalSetParameter(OMX_INDEXTYPE index, const OMX_PTR p
     switch (indexFull) {
         case OMX_IndexParamVideoBitrate:
         {
-            return internalSetBitrateParams(
-                    (const OMX_VIDEO_PARAM_BITRATETYPE *)params);
+            OMX_VIDEO_PARAM_BITRATETYPE *bitRate =
+                (OMX_VIDEO_PARAM_BITRATETYPE *)params;
+
+            if (!isValidOMXParam(bitRate)) {
+                return OMX_ErrorBadParameter;
+            }
+
+            return internalSetBitrateParams(bitRate);
         }
 
         case OMX_IndexParamVideoAvc:
         {
             OMX_VIDEO_PARAM_AVCTYPE *avcType = (OMX_VIDEO_PARAM_AVCTYPE *)params;
+
+            if (!isValidOMXParam(avcType)) {
+                return OMX_ErrorBadParameter;
+            }
 
             if (avcType->nPortIndex != 1) {
                 return OMX_ErrorUndefined;
@@ -995,10 +999,11 @@ OMX_ERRORTYPE SoftAVC::internalSetParameter(OMX_INDEXTYPE index, const OMX_PTR p
 
             if ((avcType->nAllowedPictureTypes & OMX_VIDEO_PictureTypeB) &&
                     avcType->nPFrames) {
-                mBframes = avcType->nBFrames / avcType->nPFrames;
+                mBframes = avcType->nBFrames;
             }
 
-            mIInterval = avcType->nPFrames + avcType->nBFrames;
+            mIInterval = (avcType->nPFrames + 1) * (avcType->nBFrames + 1);
+            mConstrainedIntraFlag = avcType->bconstIpred;
 
             if (OMX_VIDEO_AVCLoopFilterDisable == avcType->eLoopFilterMode)
                 mDisableDeblkLevel = 4;
@@ -1008,11 +1013,12 @@ OMX_ERRORTYPE SoftAVC::internalSetParameter(OMX_INDEXTYPE index, const OMX_PTR p
                     || avcType->nRefIdx10ActiveMinus1 != 0
                     || avcType->nRefIdx11ActiveMinus1 != 0
                     || avcType->bWeightedPPrediction != OMX_FALSE
-                    || avcType->bconstIpred != OMX_FALSE
                     || avcType->bDirect8x8Inference != OMX_FALSE
                     || avcType->bDirectSpatialTemporal != OMX_FALSE
                     || avcType->nCabacInitIdc != 0) {
-                return OMX_ErrorUndefined;
+                // OMX does not allow a way to signal what values are wrong, so it's
+                // best for components to just do best effort in supporting these values
+                ALOGV("ignoring unsupported settings");
             }
 
             if (OK != ConvertOmxAvcLevelToAvcSpecLevel(avcType->eLevel, &mAVCEncLevel)) {
@@ -1027,19 +1033,51 @@ OMX_ERRORTYPE SoftAVC::internalSetParameter(OMX_INDEXTYPE index, const OMX_PTR p
     }
 }
 
+OMX_ERRORTYPE SoftAVC::getConfig(
+        OMX_INDEXTYPE index, OMX_PTR _params) {
+    switch ((int)index) {
+        case OMX_IndexConfigAndroidIntraRefresh:
+        {
+            OMX_VIDEO_CONFIG_ANDROID_INTRAREFRESHTYPE *intraRefreshParams =
+                (OMX_VIDEO_CONFIG_ANDROID_INTRAREFRESHTYPE *)_params;
+
+            if (!isValidOMXParam(intraRefreshParams)) {
+                return OMX_ErrorBadParameter;
+            }
+
+            if (intraRefreshParams->nPortIndex != kOutputPortIndex) {
+                return OMX_ErrorUndefined;
+            }
+
+            intraRefreshParams->nRefreshPeriod =
+                    (mAIRMode == IVE_AIR_MODE_NONE) ? 0 : mAIRRefreshPeriod;
+            return OMX_ErrorNone;
+        }
+
+        default:
+            return SoftVideoEncoderOMXComponent::getConfig(index, _params);
+    }
+}
+
 OMX_ERRORTYPE SoftAVC::setConfig(
         OMX_INDEXTYPE index, const OMX_PTR _params) {
-    switch (index) {
+    switch ((int)index) {
         case OMX_IndexConfigVideoIntraVOPRefresh:
         {
             OMX_CONFIG_INTRAREFRESHVOPTYPE *params =
                 (OMX_CONFIG_INTRAREFRESHVOPTYPE *)_params;
 
+            if (!isValidOMXParam(params)) {
+                return OMX_ErrorBadParameter;
+            }
+
             if (params->nPortIndex != kOutputPortIndex) {
                 return OMX_ErrorBadPortIndex;
             }
 
-            mKeyFrameRequested = params->IntraRefreshVOP;
+            if (params->IntraRefreshVOP) {
+                mUpdateFlag |= kRequestKeyFrame;
+            }
             return OMX_ErrorNone;
         }
 
@@ -1048,14 +1086,42 @@ OMX_ERRORTYPE SoftAVC::setConfig(
             OMX_VIDEO_CONFIG_BITRATETYPE *params =
                 (OMX_VIDEO_CONFIG_BITRATETYPE *)_params;
 
+            if (!isValidOMXParam(params)) {
+                return OMX_ErrorBadParameter;
+            }
+
             if (params->nPortIndex != kOutputPortIndex) {
                 return OMX_ErrorBadPortIndex;
             }
 
             if (mBitrate != params->nEncodeBitrate) {
                 mBitrate = params->nEncodeBitrate;
-                mBitrateUpdated = true;
+                mUpdateFlag |= kUpdateBitrate;
             }
+            return OMX_ErrorNone;
+        }
+
+        case OMX_IndexConfigAndroidIntraRefresh:
+        {
+            const OMX_VIDEO_CONFIG_ANDROID_INTRAREFRESHTYPE *intraRefreshParams =
+                (const OMX_VIDEO_CONFIG_ANDROID_INTRAREFRESHTYPE *)_params;
+
+            if (!isValidOMXParam(intraRefreshParams)) {
+                return OMX_ErrorBadParameter;
+            }
+
+            if (intraRefreshParams->nPortIndex != kOutputPortIndex) {
+                return OMX_ErrorUndefined;
+            }
+
+            if (intraRefreshParams->nRefreshPeriod == 0) {
+                mAIRMode = IVE_AIR_MODE_NONE;
+                mAIRRefreshPeriod = 0;
+            } else if (intraRefreshParams->nRefreshPeriod > 0) {
+                mAIRMode = IVE_AIR_MODE_CYCLIC;
+                mAIRRefreshPeriod = intraRefreshParams->nRefreshPeriod;
+            }
+            mUpdateFlag |= kUpdateAIRMode;
             return OMX_ErrorNone;
         }
 
@@ -1071,7 +1137,7 @@ OMX_ERRORTYPE SoftAVC::internalSetBitrateParams(
     }
 
     mBitrate = bitrate->nTargetBitrate;
-    mBitrateUpdated = true;
+    mUpdateFlag |= kUpdateBitrate;
 
     return OMX_ErrorNone;
 }
@@ -1104,6 +1170,12 @@ OMX_ERRORTYPE SoftAVC::setEncodeArgs(
     ps_inp_raw_buf->e_color_fmt = mIvVideoColorFormat;
     source = NULL;
     if ((inputBufferHeader != NULL) && inputBufferHeader->nFilledLen) {
+        OMX_ERRORTYPE error = validateInputBuffer(inputBufferHeader);
+        if (error != OMX_ErrorNone) {
+            ALOGE("b/69065651");
+            android_errorWriteLog(0x534e4554, "69065651");
+            return error;
+        }
         source = inputBufferHeader->pBuffer + inputBufferHeader->nOffset;
 
         if (mInputDataIsMeta) {
@@ -1291,12 +1363,19 @@ void SoftAVC::onQueueFilled(OMX_U32 portIndex) {
             return;
         }
 
-        if (mBitrateUpdated) {
-            setBitRate();
-        }
-
-        if (mKeyFrameRequested) {
-            setFrameType(IV_IDR_FRAME);
+        if (mUpdateFlag) {
+            if (mUpdateFlag & kUpdateBitrate) {
+                setBitRate();
+            }
+            if (mUpdateFlag & kRequestKeyFrame) {
+                setFrameType(IV_IDR_FRAME);
+            }
+            if (mUpdateFlag & kUpdateAIRMode) {
+                setAirParams();
+                notify(OMX_EventPortSettingsChanged, kOutputPortIndex,
+                        OMX_IndexConfigAndroidIntraRefresh, NULL);
+            }
+            mUpdateFlag = 0;
         }
 
         if ((inputBufferHeader != NULL)
@@ -1417,6 +1496,14 @@ void SoftAVC::onQueueFilled(OMX_U32 portIndex) {
         }
     }
     return;
+}
+
+void SoftAVC::onReset() {
+    SoftVideoEncoderOMXComponent::onReset();
+
+    if (releaseEncoder() != OMX_ErrorNone) {
+        ALOGW("releaseEncoder failed");
+    }
 }
 
 }  // namespace android

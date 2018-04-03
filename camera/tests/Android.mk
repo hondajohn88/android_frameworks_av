@@ -18,9 +18,11 @@ LOCAL_ADDITIONAL_DEPENDENCIES := $(LOCAL_PATH)/Android.mk
 
 LOCAL_SRC_FILES:= \
 	VendorTagDescriptorTests.cpp \
-	CameraBinderTests.cpp
+	CameraBinderTests.cpp \
+	CameraZSLTests.cpp
 
 LOCAL_SHARED_LIBRARIES := \
+	liblog \
 	libutils \
 	libcutils \
 	libcamera_metadata \
@@ -32,14 +34,11 @@ LOCAL_SHARED_LIBRARIES := \
 	libbinder
 
 LOCAL_C_INCLUDES += \
-	system/media/camera/include \
 	system/media/private/camera/include \
 	system/media/camera/tests \
 	frameworks/av/services/camera/libcameraservice \
-	frameworks/av/include/camera \
-	frameworks/native/include \
 
-LOCAL_CFLAGS += -Wall -Wextra
+LOCAL_CFLAGS += -Wall -Wextra -Werror
 
 LOCAL_MODULE:= camera_client_test
 LOCAL_MODULE_TAGS := tests
