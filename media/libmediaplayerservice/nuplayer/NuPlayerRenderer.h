@@ -25,9 +25,9 @@
 
 namespace android {
 
-struct ABuffer;
 class  AWakeLock;
 struct MediaClock;
+class MediaCodecBuffer;
 struct VideoFrameScheduler;
 
 struct NuPlayer::Renderer : public AHandler {
@@ -46,7 +46,7 @@ struct NuPlayer::Renderer : public AHandler {
 
     void queueBuffer(
             bool audio,
-            const sp<ABuffer> &buffer,
+            const sp<MediaCodecBuffer> &buffer,
             const sp<AMessage> &notifyConsumed);
 
     void queueEOS(bool audio, status_t finalResult);
@@ -59,8 +59,6 @@ struct NuPlayer::Renderer : public AHandler {
     void flush(bool audio, bool notifyComplete);
 
     void signalTimeDiscontinuity();
-
-    void signalAudioSinkChanged();
 
     void signalDisableOffloadAudio();
     void signalEnableOffloadAudio();
@@ -78,8 +76,18 @@ struct NuPlayer::Renderer : public AHandler {
             bool offloadOnly,
             bool hasVideo,
             uint32_t flags,
-            bool *isOffloaded);
+            bool *isOffloaded,
+            bool isStreaming);
     void closeAudioSink();
+
+    // re-open audio sink after all pending audio buffers played.
+    void changeAudioFormat(
+            const sp<AMessage> &format,
+            bool offloadOnly,
+            bool hasVideo,
+            uint32_t flags,
+            bool isStreaming,
+            const sp<AMessage> &notify);
 
     enum {
         kWhatEOS                      = 'eos ',
@@ -92,8 +100,9 @@ struct NuPlayer::Renderer : public AHandler {
     };
 
     enum AudioTearDownReason {
-        kDueToError = 0,
+        kDueToError = 0,   // Could restart with either offload or non-offload.
         kDueToTimeout,
+        kForceNonOffload,  // Restart only with non-offload.
     };
 
 protected:
@@ -117,14 +126,19 @@ private:
         kWhatResume              = 'resm',
         kWhatOpenAudioSink       = 'opnA',
         kWhatCloseAudioSink      = 'clsA',
+        kWhatChangeAudioFormat   = 'chgA',
         kWhatStopAudioSink       = 'stpA',
         kWhatDisableOffloadAudio = 'noOA',
         kWhatEnableOffloadAudio  = 'enOA',
         kWhatSetVideoFrameRate   = 'sVFR',
     };
 
+    // if mBuffer != nullptr, it's a buffer containing real data.
+    // else if mNotifyConsumed == nullptr, it's EOS.
+    // else it's a tag for re-opening audio sink in different format.
     struct QueueEntry {
-        sp<ABuffer> mBuffer;
+        sp<MediaCodecBuffer> mBuffer;
+        sp<AMessage> mMeta;
         sp<AMessage> mNotifyConsumed;
         size_t mOffset;
         status_t mFinalResult;
@@ -134,6 +148,7 @@ private:
     static const int64_t kMinPositionUpdateDelayUs;
 
     sp<MediaPlayerBase::AudioSink> mAudioSink;
+    bool mUseVirtualAudioSink;
     sp<AMessage> mNotify;
     Mutex mLock;
     uint32_t mFlags;
@@ -148,6 +163,7 @@ private:
     int32_t mVideoQueueGeneration;
     int32_t mAudioDrainGeneration;
     int32_t mVideoDrainGeneration;
+    int32_t mAudioEOSGeneration;
 
     sp<MediaClock> mMediaClock;
     float mPlaybackRate; // audio track rate
@@ -178,7 +194,9 @@ private:
     int32_t mAudioRenderingStartGeneration;
     bool mRenderingDataDelivered;
 
-    int64_t mLastPositionUpdateUs;
+    int64_t mNextAudioClockUpdateTimeUs;
+    // the media timestamp of last audio sample right before EOS.
+    int64_t mLastAudioMediaTimeUs;
 
     int32_t mAudioOffloadPauseTimeoutGeneration;
     bool mAudioTornDown;
@@ -207,15 +225,15 @@ private:
     status_t getCurrentPositionFromAnchor(
             int64_t *mediaUs, int64_t nowUs, bool allowPastQueuedVideo = false);
 
+    void notifyEOSCallback();
     size_t fillAudioBuffer(void *buffer, size_t size);
 
     bool onDrainAudioQueue();
     void drainAudioQueueUntilLastEOS();
     int64_t getPendingAudioPlayoutDurationUs(int64_t nowUs);
-    int64_t getPlayedOutAudioDurationUs(int64_t nowUs);
     void postDrainAudioQueue_l(int64_t delayUs = 0);
 
-    void clearAnchorTime_l();
+    void clearAnchorTime();
     void clearAudioFirstAnchorTime_l();
     void setAudioFirstAnchorTimeIfNeeded_l(int64_t mediaUs);
     void setVideoLateByUs(int64_t lateUs);
@@ -251,15 +269,18 @@ private:
             const sp<AMessage> &format,
             bool offloadOnly,
             bool hasVideo,
-            uint32_t flags);
+            uint32_t flags,
+            bool isStreaming);
     void onCloseAudioSink();
+    void onChangeAudioFormat(const sp<AMessage> &meta, const sp<AMessage> &notify);
 
     void notifyEOS(bool audio, status_t finalResult, int64_t delayUs = 0);
+    void notifyEOS_l(bool audio, status_t finalResult, int64_t delayUs = 0);
     void notifyFlushComplete(bool audio);
     void notifyPosition();
     void notifyVideoLateBy(int64_t lateByUs);
     void notifyVideoRenderingStart();
-    void notifyAudioTearDown();
+    void notifyAudioTearDown(AudioTearDownReason reason);
 
     void flushQueue(List<QueueEntry> *queue);
     bool dropBufferIfStale(bool audio, const sp<AMessage> &msg);

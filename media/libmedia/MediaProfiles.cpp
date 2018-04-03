@@ -23,13 +23,15 @@
 #include <utils/Log.h>
 #include <utils/Vector.h>
 #include <cutils/properties.h>
-#include <libexpat/expat.h>
+#include <expat.h>
 #include <media/MediaProfiles.h>
 #include <media/stagefright/foundation/ADebug.h>
 #include <OMX_Video.h>
+#include <sys/stat.h>
 
 namespace android {
 
+constexpr char const * const MediaProfiles::xmlFiles[];
 Mutex MediaProfiles::sLock;
 bool MediaProfiles::sIsInitialized = false;
 MediaProfiles *MediaProfiles::sInstance = NULL;
@@ -37,7 +39,8 @@ MediaProfiles *MediaProfiles::sInstance = NULL;
 const MediaProfiles::NameToTagMap MediaProfiles::sVideoEncoderNameMap[] = {
     {"h263", VIDEO_ENCODER_H263},
     {"h264", VIDEO_ENCODER_H264},
-    {"m4v",  VIDEO_ENCODER_MPEG_4_SP}
+    {"m4v",  VIDEO_ENCODER_MPEG_4_SP},
+    {"hevc", VIDEO_ENCODER_HEVC}
 };
 
 const MediaProfiles::NameToTagMap MediaProfiles::sAudioEncoderNameMap[] = {
@@ -88,6 +91,19 @@ const MediaProfiles::NameToTagMap MediaProfiles::sCamcorderQualityNameMap[] = {
     {"highspeed720p", CAMCORDER_QUALITY_HIGH_SPEED_720P},
     {"highspeed1080p", CAMCORDER_QUALITY_HIGH_SPEED_1080P},
     {"highspeed2160p", CAMCORDER_QUALITY_HIGH_SPEED_2160P},
+
+    // Vendor-specific profiles
+    {"vga", CAMCORDER_QUALITY_VGA},
+    {"4kdci", CAMCORDER_QUALITY_4KDCI},
+    {"timelapsevga", CAMCORDER_QUALITY_TIME_LAPSE_VGA},
+    {"timelapse4kdci", CAMCORDER_QUALITY_TIME_LAPSE_4KDCI},
+    {"highspeedcif", CAMCORDER_QUALITY_HIGH_SPEED_CIF},
+    {"highspeedvga", CAMCORDER_QUALITY_HIGH_SPEED_VGA},
+    {"highspeed4kdci", CAMCORDER_QUALITY_HIGH_SPEED_4KDCI},
+    {"qhd", CAMCORDER_QUALITY_QHD},
+    {"2k", CAMCORDER_QUALITY_2k},
+    {"timelapseqhd", CAMCORDER_QUALITY_TIME_LAPSE_QHD},
+    {"timelapse2k", CAMCORDER_QUALITY_TIME_LAPSE_2k},
 };
 
 #if LOG_NDEBUG
@@ -423,8 +439,10 @@ MediaProfiles::startElementHandler(void *userData, const char *name, const char 
 }
 
 static bool isCamcorderProfile(camcorder_quality quality) {
-    return quality >= CAMCORDER_QUALITY_LIST_START &&
-           quality <= CAMCORDER_QUALITY_LIST_END;
+    return (quality >= CAMCORDER_QUALITY_LIST_START &&
+           quality <= CAMCORDER_QUALITY_LIST_END) ||
+            (quality >= CAMCORDER_QUALITY_VENDOR_START &&
+            quality <= CAMCORDER_QUALITY_VENDOR_END);
 }
 
 static bool isTimelapseProfile(camcorder_quality quality) {
@@ -592,14 +610,19 @@ MediaProfiles::getInstance()
     if (!sIsInitialized) {
         char value[PROPERTY_VALUE_MAX];
         if (property_get("media.settings.xml", value, NULL) <= 0) {
-            const char *defaultXmlFile = "/etc/media_profiles.xml";
-            FILE *fp = fopen(defaultXmlFile, "r");
-            if (fp == NULL) {
-                ALOGW("could not find media config xml file");
+            const char* xmlFile = nullptr;
+            for (auto const& f : xmlFiles) {
+                if (checkXmlFile(f)) {
+                    xmlFile = f;
+                    break;
+                }
+            }
+            if (xmlFile == nullptr) {
+                ALOGW("Could not find a validated xml file. "
+                        "Using the default instance instead.");
                 sInstance = createDefaultInstance();
             } else {
-                fclose(fp);  // close the file first.
-                sInstance = createInstanceFromXmlFile(defaultXmlFile);
+                sInstance = createInstanceFromXmlFile(xmlFile);
             }
         } else {
             sInstance = createInstanceFromXmlFile(value);
@@ -835,6 +858,12 @@ MediaProfiles::createDefaultInstance()
     createDefaultEncoderOutputFileFormats(profiles);
     createDefaultImageEncodingQualityLevels(profiles);
     return profiles;
+}
+
+bool MediaProfiles::checkXmlFile(const char* xmlFile) {
+    struct stat fStat;
+    return stat(xmlFile, &fStat) == 0 && S_ISREG(fStat.st_mode);
+    // TODO: Add validation
 }
 
 /*static*/ MediaProfiles*

@@ -28,7 +28,7 @@
 
 using namespace android;
 
-#define INVALID_VALUE -1
+#define INVALID_VALUE (-1)
 
 Mutex DrmManagerClientImpl::sMutex;
 sp<IDrmManagerService> DrmManagerClientImpl::sDrmManagerService;
@@ -350,7 +350,8 @@ DrmManagerClientImpl::DeathNotifier::~DeathNotifier() {
     }
 }
 
-void DrmManagerClientImpl::DeathNotifier::binderDied(const wp<IBinder>& who) {
+void DrmManagerClientImpl::DeathNotifier::binderDied(
+            const wp<IBinder>& /* who */) {
     Mutex::Autolock lock(sMutex);
     DrmManagerClientImpl::sDrmManagerService.clear();
     ALOGW("DrmManager server died!");

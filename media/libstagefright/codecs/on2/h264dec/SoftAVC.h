@@ -18,7 +18,7 @@
 
 #define SOFT_AVC_H_
 
-#include "SoftVideoDecoderOMXComponent.h"
+#include <media/stagefright/omx/SoftVideoDecoderOMXComponent.h>
 #include <utils/KeyedVector.h>
 
 #include "H264SwDecApi.h"
@@ -71,7 +71,7 @@ private:
 
     status_t initDecoder();
     void drainAllOutputBuffers(bool eos);
-    void drainOneOutputBuffer(int32_t picId, uint8_t *data);
+    bool drainOneOutputBuffer(int32_t picId, uint8_t *data);
     void saveFirstOutputBuffer(int32_t pidId, uint8_t *data);
     CropSettingsMode handleCropParams(const H264SwDecInfo& decInfo);
 

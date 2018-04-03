@@ -20,6 +20,8 @@
 #include "MtpPacket.h"
 #include "mtp.h"
 
+class IMtpHandle;
+
 namespace android {
 
 class MtpEventPacket : public MtpPacket {
@@ -29,13 +31,14 @@ public:
     virtual             ~MtpEventPacket();
 
 #ifdef MTP_DEVICE
-    // write our data to the given file descriptor
-    int                 write(int fd);
+    // write our data to the given usb handle
+    int                 write(IMtpHandle *h);
 #endif
 
 #ifdef MTP_HOST
     // read our buffer with the given request
-    int                 read(struct usb_request *request);
+    int                 sendRequest(struct usb_request *request);
+    int                 readResponse(struct usb_device *device);
 #endif
 
     inline MtpEventCode     getEventCode() const { return getContainerCode(); }

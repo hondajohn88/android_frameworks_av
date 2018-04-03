@@ -30,14 +30,17 @@ namespace android {
 
 CallbackDataSource::CallbackDataSource(
     const sp<IDataSource>& binderDataSource)
-    : mIDataSource(binderDataSource) {
+    : mIDataSource(binderDataSource),
+      mIsClosed(false) {
     // Set up the buffer to read into.
     mMemory = mIDataSource->getIMemory();
+    mName = String8::format("CallbackDataSource(%s)", mIDataSource->toString().string());
+
 }
 
 CallbackDataSource::~CallbackDataSource() {
     ALOGV("~CallbackDataSource");
-    mIDataSource->close();
+    close();
 }
 
 status_t CallbackDataSource::initCheck() const {
@@ -48,7 +51,7 @@ status_t CallbackDataSource::initCheck() const {
 }
 
 ssize_t CallbackDataSource::readAt(off64_t offset, void* data, size_t size) {
-    if (mMemory == NULL) {
+    if (mMemory == NULL || data == NULL) {
         return -1;
     }
 
@@ -64,7 +67,7 @@ ssize_t CallbackDataSource::readAt(off64_t offset, void* data, size_t size) {
             mIDataSource->readAt(offset + totalNumRead, numToRead);
         // A negative return value represents an error. Pass it on.
         if (numRead < 0) {
-            return numRead;
+            return numRead == ERROR_END_OF_STREAM && totalNumRead > 0 ? totalNumRead : numRead;
         }
         // A zero return value signals EOS. Return the bytes read so far.
         if (numRead == 0) {
@@ -95,8 +98,28 @@ status_t CallbackDataSource::getSize(off64_t *size) {
     return OK;
 }
 
+uint32_t CallbackDataSource::flags() {
+    return mIDataSource->getFlags();
+}
+
+void CallbackDataSource::close() {
+    if (!mIsClosed) {
+        mIDataSource->close();
+        mIsClosed = true;
+    }
+}
+
+sp<DecryptHandle> CallbackDataSource::DrmInitialization(const char *mime) {
+    return mIDataSource->DrmInitialization(mime);
+}
+
+sp<IDataSource> CallbackDataSource::getIDataSource() const {
+    return mIDataSource;
+}
+
 TinyCacheSource::TinyCacheSource(const sp<DataSource>& source)
     : mSource(source), mCachedOffset(0), mCachedSize(0) {
+    mName = String8::format("TinyCacheSource(%s)", mSource->toString().string());
 }
 
 status_t TinyCacheSource::initCheck() const {
@@ -104,10 +127,6 @@ status_t TinyCacheSource::initCheck() const {
 }
 
 ssize_t TinyCacheSource::readAt(off64_t offset, void* data, size_t size) {
-    if (size >= kCacheSize) {
-        return mSource->readAt(offset, data, size);
-    }
-
     // Check if the cache satisfies the read.
     if (mCachedOffset <= offset
             && offset < (off64_t) (mCachedOffset + mCachedSize)) {
@@ -131,12 +150,22 @@ ssize_t TinyCacheSource::readAt(off64_t offset, void* data, size_t size) {
         }
     }
 
+    if (size >= kCacheSize) {
+        return mSource->readAt(offset, data, size);
+    }
+
     // Fill the cache and copy to the caller.
     const ssize_t numRead = mSource->readAt(offset, mCache, kCacheSize);
     if (numRead <= 0) {
+        // Flush cache on error
+        mCachedSize = 0;
+        mCachedOffset = 0;
         return numRead;
     }
     if ((size_t)numRead > kCacheSize) {
+        // Flush cache on error
+        mCachedSize = 0;
+        mCachedOffset = 0;
         return ERROR_OUT_OF_RANGE;
     }
 
@@ -155,6 +184,18 @@ status_t TinyCacheSource::getSize(off64_t *size) {
 
 uint32_t TinyCacheSource::flags() {
     return mSource->flags();
+}
+
+sp<DecryptHandle> TinyCacheSource::DrmInitialization(const char *mime) {
+    // flush cache when DrmInitialization occurs since decrypted
+    // data may differ from what is in cache.
+    mCachedOffset = 0;
+    mCachedSize = 0;
+    return mSource->DrmInitialization(mime);
+}
+
+sp<IDataSource> TinyCacheSource::getIDataSource() const {
+    return mSource->getIDataSource();
 }
 
 } // namespace android

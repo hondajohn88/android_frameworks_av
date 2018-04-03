@@ -26,14 +26,10 @@
 #include <binder/BinderService.h>
 #include <system/audio.h>
 #include <system/audio_policy.h>
-#include <hardware/audio_policy.h>
 #include <media/IAudioPolicyService.h>
 #include <media/ToneGenerator.h>
 #include <media/AudioEffect.h>
 #include <media/AudioPolicy.h>
-#ifdef USE_LEGACY_AUDIO_POLICY
-#include <hardware_legacy/AudioPolicyInterface.h>
-#endif
 #include "AudioPolicyEffects.h"
 #include "managerdefault/AudioPolicyManager.h"
 
@@ -66,6 +62,9 @@ public:
     virtual audio_policy_dev_state_t getDeviceConnectionState(
                                                                 audio_devices_t device,
                                                                 const char *device_address);
+    virtual status_t handleDeviceConfigChange(audio_devices_t device,
+                                              const char *device_address,
+                                              const char *device_name);
     virtual status_t setPhoneState(audio_mode_t state);
     virtual status_t setForceUse(audio_policy_force_use_t usage, audio_policy_forced_cfg_t config);
     virtual audio_policy_forced_cfg_t getForceUse(audio_policy_force_use_t usage);
@@ -81,12 +80,10 @@ public:
                                       audio_session_t session,
                                       audio_stream_type_t *stream,
                                       uid_t uid,
-                                      uint32_t samplingRate = 0,
-                                      audio_format_t format = AUDIO_FORMAT_DEFAULT,
-                                      audio_channel_mask_t channelMask = 0,
-                                      audio_output_flags_t flags = AUDIO_OUTPUT_FLAG_NONE,
-                                      audio_port_handle_t selectedDeviceId = AUDIO_PORT_HANDLE_NONE,
-                                      const audio_offload_info_t *offloadInfo = NULL);
+                                      const audio_config_t *config,
+                                      audio_output_flags_t flags,
+                                      audio_port_handle_t *selectedDeviceId,
+                                      audio_port_handle_t *portId);
     virtual status_t startOutput(audio_io_handle_t output,
                                  audio_stream_type_t stream,
                                  audio_session_t session);
@@ -99,12 +96,12 @@ public:
     virtual status_t getInputForAttr(const audio_attributes_t *attr,
                                      audio_io_handle_t *input,
                                      audio_session_t session,
+                                     pid_t pid,
                                      uid_t uid,
-                                     uint32_t samplingRate,
-                                     audio_format_t format,
-                                     audio_channel_mask_t channelMask,
+                                     const audio_config_base_t *config,
                                      audio_input_flags_t flags,
-                                     audio_port_handle_t selectedDeviceId = AUDIO_PORT_HANDLE_NONE);
+                                     audio_port_handle_t *selectedDeviceId = NULL,
+                                     audio_port_handle_t *portId = NULL);
     virtual status_t startInput(audio_io_handle_t input,
                                 audio_session_t session);
     virtual status_t stopInput(audio_io_handle_t input,
@@ -128,7 +125,7 @@ public:
     virtual status_t registerEffect(const effect_descriptor_t *desc,
                                     audio_io_handle_t io,
                                     uint32_t strategy,
-                                    int session,
+                                    audio_session_t session,
                                     int id);
     virtual status_t unregisterEffect(int id);
     virtual status_t setEffectEnabled(int id, bool enabled);
@@ -136,7 +133,7 @@ public:
     virtual bool isStreamActiveRemotely(audio_stream_type_t stream, uint32_t inPastMs = 0) const;
     virtual bool isSourceActive(audio_source_t source) const;
 
-    virtual status_t queryDefaultPreProcessing(int audioSession,
+    virtual status_t queryDefaultPreProcessing(audio_session_t audioSession,
                                               effect_descriptor_t *descriptors,
                                               uint32_t *count);
     virtual     status_t    onTransact(
@@ -195,12 +192,21 @@ public:
 
     virtual audio_mode_t getPhoneState();
 
-    virtual status_t registerPolicyMixes(Vector<AudioMix> mixes, bool registration);
+    virtual status_t registerPolicyMixes(const Vector<AudioMix>& mixes, bool registration);
 
     virtual status_t startAudioSource(const struct audio_port_config *source,
                                       const audio_attributes_t *attributes,
-                                      audio_io_handle_t *handle);
-    virtual status_t stopAudioSource(audio_io_handle_t handle);
+                                      audio_patch_handle_t *handle);
+    virtual status_t stopAudioSource(audio_patch_handle_t handle);
+
+    virtual status_t setMasterMono(bool mono);
+    virtual status_t getMasterMono(bool *mono);
+
+    virtual float    getStreamVolumeDB(
+                audio_stream_type_t stream, int index, audio_devices_t device);
+
+    virtual status_t listAudioSessions(audio_stream_type_t stream,
+                                       Vector< sp<AudioSessionInfo>>& sessions);
 
             status_t doStopOutput(audio_io_handle_t output,
                                   audio_stream_type_t stream,
@@ -223,8 +229,17 @@ public:
             void onAudioPatchListUpdate();
             void doOnAudioPatchListUpdate();
 
-            void onDynamicPolicyMixStateUpdate(String8 regId, int32_t state);
-            void doOnDynamicPolicyMixStateUpdate(String8 regId, int32_t state);
+            void onDynamicPolicyMixStateUpdate(const String8& regId, int32_t state);
+            void doOnDynamicPolicyMixStateUpdate(const String8& regId, int32_t state);
+            void onRecordingConfigurationUpdate(int event, const record_client_info_t *clientInfo,
+                    const audio_config_base_t *clientConfig,
+                    const audio_config_base_t *deviceConfig, audio_patch_handle_t patchHandle);
+            void doOnRecordingConfigurationUpdate(int event, const record_client_info_t *clientInfo,
+                    const audio_config_base_t *clientConfig,
+                    const audio_config_base_t *deviceConfig, audio_patch_handle_t patchHandle);
+
+            void onOutputSessionEffectsUpdate(sp<AudioSessionInfo>& info, bool added);
+            void doOnOutputSessionEffectsUpdate(sp<AudioSessionInfo>& info, bool added);
 
 private:
                         AudioPolicyService() ANDROID_API;
@@ -256,7 +271,9 @@ private:
             UPDATE_AUDIOPORT_LIST,
             UPDATE_AUDIOPATCH_LIST,
             SET_AUDIOPORT_CONFIG,
-            DYN_POLICY_MIX_STATE_UPDATE
+            DYN_POLICY_MIX_STATE_UPDATE,
+            RECORDING_CONFIGURATION_UPDATE,
+            EFFECT_SESSION_UPDATE,
         };
 
         AudioCommandThread (String8 name, const wp<AudioPolicyService>& service);
@@ -294,8 +311,15 @@ private:
                     void        updateAudioPatchListCommand();
                     status_t    setAudioPortConfigCommand(const struct audio_port_config *config,
                                                           int delayMs);
-                    void        dynamicPolicyMixStateUpdateCommand(String8 regId, int32_t state);
+                    void        dynamicPolicyMixStateUpdateCommand(const String8& regId, int32_t state);
+                    void        recordingConfigurationUpdateCommand(
+                                                        int event,
+                                                        const record_client_info_t *clientInfo,
+                                                        const audio_config_base_t *clientConfig,
+                                                        const audio_config_base_t *deviceConfig,
+                                                        audio_patch_handle_t patchHandle);
                     void        insertCommand_l(AudioCommand *command, int delayMs = 0);
+                    void        effectSessionUpdateCommand(sp<AudioSessionInfo>& info, bool added);
 
     private:
         class AudioCommandData;
@@ -385,6 +409,21 @@ private:
             int32_t mState;
         };
 
+        class RecordingConfigurationUpdateData : public AudioCommandData {
+        public:
+            int mEvent;
+            record_client_info_t mClientInfo;
+            struct audio_config_base mClientConfig;
+            struct audio_config_base mDeviceConfig;
+            audio_patch_handle_t mPatchHandle;
+        };
+
+        class EffectSessionUpdateData : public AudioCommandData {
+        public:
+            sp<AudioSessionInfo> mAudioSessionInfo;
+            bool mAdded;
+        };
+
         Mutex   mLock;
         Condition mWaitWorkCV;
         Vector < sp<AudioCommand> > mAudioCommands; // list of pending commands
@@ -397,7 +436,7 @@ private:
     class AudioPolicyClient : public AudioPolicyClientInterface
     {
      public:
-        AudioPolicyClient(AudioPolicyService *service) : mAudioPolicyService(service) {}
+        explicit AudioPolicyClient(AudioPolicyService *service) : mAudioPolicyService(service) {}
         virtual ~AudioPolicyClient() {}
 
         //
@@ -472,7 +511,7 @@ private:
         virtual status_t setVoiceVolume(float volume, int delayMs = 0);
 
         // move effect to the specified output
-        virtual status_t moveEffects(int session,
+        virtual status_t moveEffects(audio_session_t session,
                                          audio_io_handle_t srcOutput,
                                          audio_io_handle_t dstOutput);
 
@@ -491,8 +530,15 @@ private:
         virtual void onAudioPortListUpdate();
         virtual void onAudioPatchListUpdate();
         virtual void onDynamicPolicyMixStateUpdate(String8 regId, int32_t state);
+        virtual void onRecordingConfigurationUpdate(int event,
+                        const record_client_info_t *clientInfo,
+                        const audio_config_base_t *clientConfig,
+                        const audio_config_base_t *deviceConfig, audio_patch_handle_t patchHandle);
 
-        virtual audio_unique_id_t newAudioUniqueId();
+        virtual audio_unique_id_t newAudioUniqueId(audio_unique_id_use_t use);
+
+        virtual void onOutputSessionEffectsUpdate(sp<AudioSessionInfo>& info, bool added);
+
 
      private:
         AudioPolicyService *mAudioPolicyService;
@@ -508,9 +554,15 @@ private:
 
                             void      onAudioPortListUpdate();
                             void      onAudioPatchListUpdate();
-                            void      onDynamicPolicyMixStateUpdate(String8 regId, int32_t state);
+                            void      onDynamicPolicyMixStateUpdate(const String8& regId, int32_t state);
+                            void      onRecordingConfigurationUpdate(
+                                        int event, const record_client_info_t *clientInfo,
+                                        const audio_config_base_t *clientConfig,
+                                        const audio_config_base_t *deviceConfig,
+                                        audio_patch_handle_t patchHandle);
                             void      setAudioPortCallbacksEnabled(bool enabled);
-
+                            void      onOutputSessionEffectsUpdate(sp<AudioSessionInfo>& info,
+                                                                   bool added);
                 // IBinder::DeathRecipient
                 virtual     void        binderDied(const wp<IBinder>& who);
 
@@ -530,6 +582,10 @@ private:
 
     mutable Mutex mLock;    // prevents concurrent access to AudioPolicy manager functions changing
                             // device connection state  or routing
+    mutable Mutex mEffectsLock; // serialize access to Effect state within APM.
+    // Note: lock acquisition order is always mLock > mEffectsLock:
+    // mLock protects AudioPolicyManager methods that can call into audio flinger
+    // and possibly back in to audio policy service and acquire mEffectsLock.
     sp<AudioCommandThread> mAudioCommandThread;     // audio commands thread
     sp<AudioCommandThread> mTonePlaybackThread;     // tone playback thread
     sp<AudioCommandThread> mOutputCommandThread;    // process stop and release output

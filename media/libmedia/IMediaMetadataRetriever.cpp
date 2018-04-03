@@ -75,7 +75,7 @@ enum {
 class BpMediaMetadataRetriever: public BpInterface<IMediaMetadataRetriever>
 {
 public:
-    BpMediaMetadataRetriever(const sp<IBinder>& impl)
+    explicit BpMediaMetadataRetriever(const sp<IBinder>& impl)
         : BpInterface<IMediaMetadataRetriever>(impl)
     {
     }
@@ -127,22 +127,32 @@ public:
         return reply.readInt32();
     }
 
-    status_t setDataSource(const sp<IDataSource>& source)
+    status_t setDataSource(const sp<IDataSource>& source, const char *mime)
     {
         Parcel data, reply;
         data.writeInterfaceToken(IMediaMetadataRetriever::getInterfaceDescriptor());
         data.writeStrongBinder(IInterface::asBinder(source));
+
+        if (mime != NULL) {
+            data.writeInt32(1);
+            data.writeCString(mime);
+        } else {
+            data.writeInt32(0);
+        }
         remote()->transact(SET_DATA_SOURCE_CALLBACK, data, &reply);
         return reply.readInt32();
     }
 
-    sp<IMemory> getFrameAtTime(int64_t timeUs, int option)
+    sp<IMemory> getFrameAtTime(int64_t timeUs, int option, int colorFormat, bool metaOnly)
     {
-        ALOGV("getTimeAtTime: time(%" PRId64 " us) and option(%d)", timeUs, option);
+        ALOGV("getTimeAtTime: time(%" PRId64 " us), option(%d), colorFormat(%d) metaOnly(%d)",
+                timeUs, option, colorFormat, metaOnly);
         Parcel data, reply;
         data.writeInterfaceToken(IMediaMetadataRetriever::getInterfaceDescriptor());
         data.writeInt64(timeUs);
         data.writeInt32(option);
+        data.writeInt32(colorFormat);
+        data.writeInt32(metaOnly);
 #ifndef DISABLE_GROUP_SCHEDULE_HACK
         sendSchedPolicy(data);
 #endif
@@ -224,6 +234,11 @@ status_t BnMediaMetadataRetriever::onTransact(
 
             const char* srcUrl = data.readCString();
 
+            if (httpService == NULL || srcUrl == NULL) {
+                reply->writeInt32(BAD_VALUE);
+                return NO_ERROR;
+            }
+
             KeyedVector<String8, String8> headers;
             size_t numHeaders = (size_t) data.readInt64();
             for (size_t i = 0; i < numHeaders; ++i) {
@@ -240,7 +255,7 @@ status_t BnMediaMetadataRetriever::onTransact(
         } break;
         case SET_DATA_SOURCE_FD: {
             CHECK_INTERFACE(IMediaMetadataRetriever, data, reply);
-            int fd = dup(data.readFileDescriptor());
+            int fd = data.readFileDescriptor();
             int64_t offset = data.readInt64();
             int64_t length = data.readInt64();
             reply->writeInt32(setDataSource(fd, offset, length));
@@ -250,18 +265,30 @@ status_t BnMediaMetadataRetriever::onTransact(
             CHECK_INTERFACE(IMediaMetadataRetriever, data, reply);
             sp<IDataSource> source =
                 interface_cast<IDataSource>(data.readStrongBinder());
-            reply->writeInt32(setDataSource(source));
+            if (source == NULL) {
+                reply->writeInt32(BAD_VALUE);
+            } else {
+                int32_t hasMime = data.readInt32();
+                const char *mime = NULL;
+                if (hasMime) {
+                    mime = data.readCString();
+                }
+                reply->writeInt32(setDataSource(source, mime));
+            }
             return NO_ERROR;
         } break;
         case GET_FRAME_AT_TIME: {
             CHECK_INTERFACE(IMediaMetadataRetriever, data, reply);
             int64_t timeUs = data.readInt64();
             int option = data.readInt32();
-            ALOGV("getTimeAtTime: time(%" PRId64 " us) and option(%d)", timeUs, option);
+            int colorFormat = data.readInt32();
+            bool metaOnly = (data.readInt32() != 0);
+            ALOGV("getTimeAtTime: time(%" PRId64 " us), option(%d), colorFormat(%d), metaOnly(%d)",
+                    timeUs, option, colorFormat, metaOnly);
 #ifndef DISABLE_GROUP_SCHEDULE_HACK
             setSchedPolicy(data);
 #endif
-            sp<IMemory> bitmap = getFrameAtTime(timeUs, option);
+            sp<IMemory> bitmap = getFrameAtTime(timeUs, option, colorFormat, metaOnly);
             if (bitmap != 0) {  // Don't send NULL across the binder interface
                 reply->writeInt32(NO_ERROR);
                 reply->writeStrongBinder(IInterface::asBinder(bitmap));

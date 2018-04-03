@@ -28,11 +28,14 @@
 #include <utils/String8.h>
 
 namespace android {
-
 struct AMessage;
 class DataSource;
 class SampleTable;
 class String8;
+namespace heif {
+class ItemTable;
+}
+using heif::ItemTable;
 
 struct SidxEntry {
     size_t mSize;
@@ -50,20 +53,24 @@ struct Trex {
 class MPEG4Extractor : public MediaExtractor {
 public:
     // Extractor assumes ownership of "source".
-    MPEG4Extractor(const sp<DataSource> &source);
+    explicit MPEG4Extractor(const sp<DataSource> &source);
 
     virtual size_t countTracks();
-    virtual sp<MediaSource> getTrack(size_t index);
+    virtual sp<IMediaSource> getTrack(size_t index);
     virtual sp<MetaData> getTrackMetaData(size_t index, uint32_t flags);
 
     virtual sp<MetaData> getMetaData();
     virtual uint32_t flags() const;
+    virtual const char * name() { return "MPEG4Extractor"; }
+    virtual void release();
 
     // for DRM
     virtual char* getDrmTrackInfo(size_t trackID, int *len);
 
 protected:
     virtual ~MPEG4Extractor();
+
+    virtual void populateMetrics();
 
 private:
 
@@ -92,8 +99,9 @@ private:
 
     sp<DataSource> mDataSource;
     status_t mInitCheck;
-    bool mHasVideo;
     uint32_t mHeaderTimescale;
+    bool mIsQT;
+    bool mIsHEIF;
 
     Track *mFirstTrack, *mLastTrack;
 
@@ -109,6 +117,7 @@ private:
     status_t readMetaData();
     status_t parseChunk(off64_t *offset, int depth);
     status_t parseITunesMetaData(off64_t offset, size_t size);
+    status_t parseColorInfo(off64_t offset, size_t size);
     status_t parse3GPPMetaData(off64_t offset, size_t size, int depth);
     void parseID3v2MetaData(off64_t offset);
     status_t parseQTMetaKey(off64_t data_offset, size_t data_size);
@@ -130,6 +139,8 @@ private:
     SINF *mFirstSINF;
 
     bool mIsDrm;
+    sp<ItemTable> mItemTable;
+
     status_t parseDrmSINF(off64_t *offset, off64_t data_offset);
 
     status_t parseTrackHeader(off64_t data_offset, off64_t data_size);
@@ -137,6 +148,9 @@ private:
     status_t parseSegmentIndex(off64_t data_offset, size_t data_size);
 
     Track *findTrackByMimePrefix(const char *mimePrefix);
+
+    status_t parseAC3SampleEntry(off64_t offset);
+    status_t parseAC3SpecificBox(off64_t offset, uint16_t sampleRate);
 
     MPEG4Extractor(const MPEG4Extractor &);
     MPEG4Extractor &operator=(const MPEG4Extractor &);

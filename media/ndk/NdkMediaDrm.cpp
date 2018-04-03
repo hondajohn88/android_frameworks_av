@@ -17,8 +17,9 @@
 //#define LOG_NDEBUG 0
 #define LOG_TAG "NdkMediaDrm"
 
-#include "NdkMediaDrm.h"
+#include <media/NdkMediaDrm.h>
 
+#include <cutils/properties.h>
 #include <utils/Log.h>
 #include <utils/StrongPointer.h>
 #include <gui/Surface.h>
@@ -27,8 +28,8 @@
 #include <media/IDrmClient.h>
 #include <media/stagefright/MediaErrors.h>
 #include <binder/IServiceManager.h>
-#include <media/IMediaPlayerService.h>
-#include <ndk/NdkMediaCrypto.h>
+#include <media/IMediaDrmService.h>
+#include <media/NdkMediaCrypto.h>
 
 
 using namespace android;
@@ -98,11 +99,12 @@ void DrmListener::notify(DrmPlugin::EventType eventType, int extra, const Parcel
             break;
         default:
             ALOGE("Invalid event DrmPlugin::EventType %d, ignored", (int)eventType);
-            return;
+            goto cleanup;
     }
 
     (*mListener)(mObj, &sessionId, ndkEventType, extra, data, dataSize);
 
+ cleanup:
     delete [] sessionId.ptr;
     delete [] data;
 }
@@ -148,23 +150,17 @@ static media_status_t translateStatus(status_t status) {
 
 static sp<IDrm> CreateDrm() {
     sp<IServiceManager> sm = defaultServiceManager();
+    sp<IBinder> binder = sm->getService(String16("media.drm"));
 
-    sp<IBinder> binder =
-        sm->getService(String16("media.player"));
-
-    sp<IMediaPlayerService> service =
-        interface_cast<IMediaPlayerService>(binder);
-
+    sp<IMediaDrmService> service = interface_cast<IMediaDrmService>(binder);
     if (service == NULL) {
         return NULL;
     }
 
     sp<IDrm> drm = service->makeDrm();
-
     if (drm == NULL || (drm->initCheck() != OK && drm->initCheck() != NO_INIT)) {
         return NULL;
     }
-
     return drm;
 }
 
@@ -176,7 +172,8 @@ static sp<IDrm> CreateDrmFromUUID(const AMediaUUID uuid) {
         return NULL;
     }
 
-    status_t err = drm->createPlugin(uuid);
+    String8 nullPackageName;
+    status_t err = drm->createPlugin(uuid, nullPackageName);
 
     if (err != OK) {
         return NULL;
@@ -226,8 +223,7 @@ media_status_t AMediaDrm_setOnEventListener(AMediaDrm *mObj, AMediaDrmEventListe
 
 
 static bool findId(AMediaDrm *mObj, const AMediaDrmByteArray &id, List<idvec_t>::iterator &iter) {
-    iter = mObj->mIds.begin();
-    while (iter != mObj->mIds.end()) {
+    for (iter = mObj->mIds.begin(); iter != mObj->mIds.end(); ++iter) {
         if (iter->array() == id.ptr && iter->size() == id.length) {
             return true;
         }
@@ -425,7 +421,7 @@ media_status_t AMediaDrm_queryKeyStatus(AMediaDrm *mObj, const AMediaDrmSessionI
 
     for (size_t i = 0; i < mObj->mQueryResults.size(); i++) {
         keyValuePairs[i].mKey = mObj->mQueryResults.keyAt(i).string();
-        keyValuePairs[i].mValue = mObj->mQueryResults.keyAt(i).string();
+        keyValuePairs[i].mValue = mObj->mQueryResults.valueAt(i).string();
     }
     *numPairs = mObj->mQueryResults.size();
     return AMEDIA_OK;
@@ -616,9 +612,9 @@ static media_status_t encrypt_decrypt_common(AMediaDrm *mObj,
 
     Vector<uint8_t> outputVec;
     if (encrypt) {
-        status_t status = mObj->mDrm->encrypt(*iter, keyIdVec, inputVec, ivVec, outputVec);
+        status = mObj->mDrm->encrypt(*iter, keyIdVec, inputVec, ivVec, outputVec);
     } else {
-        status_t status = mObj->mDrm->decrypt(*iter, keyIdVec, inputVec, ivVec, outputVec);
+        status = mObj->mDrm->decrypt(*iter, keyIdVec, inputVec, ivVec, outputVec);
     }
     if (status == OK) {
         memcpy(output, outputVec.array(), outputVec.size());

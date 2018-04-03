@@ -18,18 +18,37 @@
 #define LOG_TAG "OMXMaster"
 #include <utils/Log.h>
 
-#include "OMXMaster.h"
-
-#include "SoftOMXPlugin.h"
+#include <media/stagefright/omx/OMXMaster.h>
+#include <media/stagefright/omx/SoftOMXPlugin.h>
+#include <media/stagefright/foundation/ADebug.h>
 
 #include <dlfcn.h>
-
-#include <media/stagefright/foundation/ADebug.h>
+#include <fcntl.h>
 
 namespace android {
 
 OMXMaster::OMXMaster()
     : mVendorLibHandle(NULL) {
+
+    pid_t pid = getpid();
+    char filename[20];
+    snprintf(filename, sizeof(filename), "/proc/%d/comm", pid);
+    int fd = open(filename, O_RDONLY);
+    if (fd < 0) {
+      ALOGW("couldn't determine process name");
+      strlcpy(mProcessName, "<unknown>", sizeof(mProcessName));
+    } else {
+      ssize_t len = read(fd, mProcessName, sizeof(mProcessName));
+      if (len < 2) {
+        ALOGW("couldn't determine process name");
+        strlcpy(mProcessName, "<unknown>", sizeof(mProcessName));
+      } else {
+        // the name is newline terminated, so erase the newline
+        mProcessName[len - 1] = 0;
+      }
+      close(fd);
+    }
+
     addVendorPlugin();
     addPlugin(new SoftOMXPlugin);
 }
@@ -123,6 +142,7 @@ OMX_ERRORTYPE OMXMaster::makeComponentInstance(
         const OMX_CALLBACKTYPE *callbacks,
         OMX_PTR appData,
         OMX_COMPONENTTYPE **component) {
+    ALOGI("makeComponentInstance(%s) in %s process", name, mProcessName);
     Mutex::Autolock autoLock(mLock);
 
     *component = NULL;

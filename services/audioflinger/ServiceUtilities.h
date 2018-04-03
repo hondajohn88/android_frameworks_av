@@ -19,10 +19,10 @@
 namespace android {
 
 extern pid_t getpid_cached;
-
-bool recordingAllowed(const String16& opPackageName);
-bool captureAudioOutputAllowed();
-bool captureHotwordAllowed();
+bool isTrustedCallingUid(uid_t uid);
+bool recordingAllowed(const String16& opPackageName, pid_t pid, uid_t uid);
+bool captureAudioOutputAllowed(pid_t pid, uid_t uid);
+bool captureHotwordAllowed(pid_t pid, uid_t uid);
 bool settingsAllowed();
 bool modifyAudioRoutingAllowed();
 bool dumpAllowed();

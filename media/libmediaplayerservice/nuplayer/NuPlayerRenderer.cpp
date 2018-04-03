@@ -19,8 +19,8 @@
 #include <utils/Log.h>
 
 #include "NuPlayerRenderer.h"
+#include <algorithm>
 #include <cutils/properties.h>
-#include <media/stagefright/foundation/ABuffer.h>
 #include <media/stagefright/foundation/ADebug.h>
 #include <media/stagefright/foundation/AMessage.h>
 #include <media/stagefright/foundation/AUtils.h>
@@ -30,6 +30,7 @@
 #include <media/stagefright/MetaData.h>
 #include <media/stagefright/Utils.h>
 #include <media/stagefright/VideoFrameScheduler.h>
+#include <media/MediaCodecBuffer.h>
 
 #include <inttypes.h>
 
@@ -69,6 +70,11 @@ static inline int32_t getAudioSinkPcmMsSetting() {
 // is closed to allow the audio DSP to power down.
 static const int64_t kOffloadPauseMaxUs = 10000000ll;
 
+// Maximum allowed delay from AudioSink, 1.5 seconds.
+static const int64_t kMaxAllowedAudioSinkDelayUs = 1500000ll;
+
+static const int64_t kMinimumAudioClockUpdatePeriodUs = 20 /* msec */ * 1000;
+
 // static
 const NuPlayer::Renderer::PcmInfo NuPlayer::Renderer::AUDIO_PCMINFO_INITIALIZER = {
         AUDIO_CHANNEL_NONE,
@@ -86,6 +92,7 @@ NuPlayer::Renderer::Renderer(
         const sp<AMessage> &notify,
         uint32_t flags)
     : mAudioSink(sink),
+      mUseVirtualAudioSink(false),
       mNotify(notify),
       mFlags(flags),
       mNumFramesWritten(0),
@@ -95,6 +102,7 @@ NuPlayer::Renderer::Renderer(
       mVideoQueueGeneration(0),
       mAudioDrainGeneration(0),
       mVideoDrainGeneration(0),
+      mAudioEOSGeneration(0),
       mPlaybackSettings(AUDIO_PLAYBACK_RATE_DEFAULT),
       mAudioFirstAnchorTimeMediaUs(-1),
       mAnchorTimeMediaUs(-1),
@@ -112,6 +120,8 @@ NuPlayer::Renderer::Renderer(
       mVideoRenderingStartGeneration(0),
       mAudioRenderingStartGeneration(0),
       mRenderingDataDelivered(false),
+      mNextAudioClockUpdateTimeUs(-1),
+      mLastAudioMediaTimeUs(-1),
       mAudioOffloadPauseTimeoutGeneration(0),
       mAudioTornDown(false),
       mCurrentOffloadInfo(AUDIO_INFO_INITIALIZER),
@@ -131,16 +141,28 @@ NuPlayer::Renderer::~Renderer() {
         mAudioSink->flush();
         mAudioSink->close();
     }
+
+    // Try to avoid racing condition in case callback is still on.
+    Mutex::Autolock autoLock(mLock);
+    if (mUseAudioCallback) {
+        flushQueue(&mAudioQueue);
+        flushQueue(&mVideoQueue);
+    }
+    mWakeLock.clear();
+    mMediaClock.clear();
+    mVideoScheduler.clear();
+    mNotify.clear();
+    mAudioSink.clear();
 }
 
 void NuPlayer::Renderer::queueBuffer(
         bool audio,
-        const sp<ABuffer> &buffer,
+        const sp<MediaCodecBuffer> &buffer,
         const sp<AMessage> &notifyConsumed) {
     sp<AMessage> msg = new AMessage(kWhatQueueBuffer, this);
     msg->setInt32("queueGeneration", getQueueGeneration(audio));
     msg->setInt32("audio", static_cast<int32_t>(audio));
-    msg->setBuffer("buffer", buffer);
+    msg->setObject("buffer", buffer);
     msg->setMessage("notifyConsumed", notifyConsumed);
     msg->post();
 }
@@ -276,7 +298,7 @@ void NuPlayer::Renderer::flush(bool audio, bool notifyComplete) {
             ++mVideoDrainGeneration;
         }
 
-        clearAnchorTime_l();
+        mMediaClock->clearAnchor();
         mVideoLateByUs = 0;
         mSyncQueues = false;
     }
@@ -311,8 +333,33 @@ void NuPlayer::Renderer::setVideoFrameRate(float fps) {
     msg->post();
 }
 
-// Called on any threads.
+// Called on any threads without mLock acquired.
 status_t NuPlayer::Renderer::getCurrentPosition(int64_t *mediaUs) {
+    status_t result = mMediaClock->getMediaTime(ALooper::GetNowUs(), mediaUs);
+    if (result == OK) {
+        return result;
+    }
+
+    // MediaClock has not started yet. Try to start it if possible.
+    {
+        Mutex::Autolock autoLock(mLock);
+        if (mAudioFirstAnchorTimeMediaUs == -1) {
+            return result;
+        }
+
+        AudioTimestamp ts;
+        status_t res = mAudioSink->getTimestamp(ts);
+        if (res != OK) {
+            return result;
+        }
+
+        // AudioSink has rendered some frames.
+        int64_t nowUs = ALooper::GetNowUs();
+        int64_t nowMediaUs = mAudioSink->getPlayedOutDurationUs(nowUs)
+                + mAudioFirstAnchorTimeMediaUs;
+        mMediaClock->updateAnchor(nowMediaUs, nowUs, -1);
+    }
+
     return mMediaClock->getMediaTime(ALooper::GetNowUs(), mediaUs);
 }
 
@@ -328,7 +375,8 @@ void NuPlayer::Renderer::setAudioFirstAnchorTimeIfNeeded_l(int64_t mediaUs) {
     }
 }
 
-void NuPlayer::Renderer::clearAnchorTime_l() {
+// Called on renderer looper.
+void NuPlayer::Renderer::clearAnchorTime() {
     mMediaClock->clearAnchor();
     mAnchorTimeMediaUs = -1;
     mAnchorNumFramesWritten = -1;
@@ -349,18 +397,20 @@ status_t NuPlayer::Renderer::openAudioSink(
         bool offloadOnly,
         bool hasVideo,
         uint32_t flags,
-        bool *isOffloaded) {
+        bool *isOffloaded,
+        bool isStreaming) {
     sp<AMessage> msg = new AMessage(kWhatOpenAudioSink, this);
     msg->setMessage("format", format);
     msg->setInt32("offload-only", offloadOnly);
     msg->setInt32("has-video", hasVideo);
     msg->setInt32("flags", flags);
+    msg->setInt32("isStreaming", isStreaming);
 
     sp<AMessage> response;
-    msg->postAndAwaitResponse(&response);
+    status_t postStatus = msg->postAndAwaitResponse(&response);
 
     int32_t err;
-    if (!response->findInt32("err", &err)) {
+    if (postStatus != OK || response.get() == nullptr || !response->findInt32("err", &err)) {
         err = INVALID_OPERATION;
     } else if (err == OK && isOffloaded != NULL) {
         int32_t offload;
@@ -375,6 +425,27 @@ void NuPlayer::Renderer::closeAudioSink() {
 
     sp<AMessage> response;
     msg->postAndAwaitResponse(&response);
+}
+
+void NuPlayer::Renderer::changeAudioFormat(
+        const sp<AMessage> &format,
+        bool offloadOnly,
+        bool hasVideo,
+        uint32_t flags,
+        bool isStreaming,
+        const sp<AMessage> &notify) {
+    sp<AMessage> meta = new AMessage;
+    meta->setMessage("format", format);
+    meta->setInt32("offload-only", offloadOnly);
+    meta->setInt32("has-video", hasVideo);
+    meta->setInt32("flags", flags);
+    meta->setInt32("isStreaming", isStreaming);
+
+    sp<AMessage> msg = new AMessage(kWhatChangeAudioFormat, this);
+    msg->setInt32("queueGeneration", getQueueGeneration(true /* audio */));
+    msg->setMessage("notify", notify);
+    msg->setMessage("meta", meta);
+    msg->post();
 }
 
 void NuPlayer::Renderer::onMessageReceived(const sp<AMessage> &msg) {
@@ -393,7 +464,10 @@ void NuPlayer::Renderer::onMessageReceived(const sp<AMessage> &msg) {
             uint32_t flags;
             CHECK(msg->findInt32("flags", (int32_t *)&flags));
 
-            status_t err = onOpenAudioSink(format, offloadOnly, hasVideo, flags);
+            uint32_t isStreaming;
+            CHECK(msg->findInt32("isStreaming", (int32_t *)&isStreaming));
+
+            status_t err = onOpenAudioSink(format, offloadOnly, hasVideo, flags, isStreaming);
 
             sp<AMessage> response = new AMessage;
             response->setInt32("err", err);
@@ -421,6 +495,41 @@ void NuPlayer::Renderer::onMessageReceived(const sp<AMessage> &msg) {
         case kWhatStopAudioSink:
         {
             mAudioSink->stop();
+            break;
+        }
+
+        case kWhatChangeAudioFormat:
+        {
+            int32_t queueGeneration;
+            CHECK(msg->findInt32("queueGeneration", &queueGeneration));
+
+            sp<AMessage> notify;
+            CHECK(msg->findMessage("notify", &notify));
+
+            if (offloadingAudio()) {
+                ALOGW("changeAudioFormat should NOT be called in offload mode");
+                notify->setInt32("err", INVALID_OPERATION);
+                notify->post();
+                break;
+            }
+
+            sp<AMessage> meta;
+            CHECK(msg->findMessage("meta", &meta));
+
+            if (queueGeneration != getQueueGeneration(true /* audio */)
+                    || mAudioQueue.empty()) {
+                onChangeAudioFormat(meta, notify);
+                break;
+            }
+
+            QueueEntry entry;
+            entry.mNotifyConsumed = notify;
+            entry.mMeta = meta;
+
+            Mutex::Autolock autoLock(mLock);
+            mAudioQueue.push_back(entry);
+            postDrainAudioQueue_l();
+
             break;
         }
 
@@ -453,8 +562,14 @@ void NuPlayer::Renderer::onMessageReceived(const sp<AMessage> &msg) {
 
                 // Let's give it more data after about half that time
                 // has elapsed.
+                delayUs /= 2;
+                // check the buffer size to estimate maximum delay permitted.
+                const int64_t maxDrainDelayUs = std::max(
+                        mAudioSink->getBufferDurationInUs(), (int64_t)500000 /* half second */);
+                ALOGD_IF(delayUs > maxDrainDelayUs, "postDrainAudioQueue long delay: %lld > %lld",
+                        (long long)delayUs, (long long)maxDrainDelayUs);
                 Mutex::Autolock autoLock(mLock);
-                postDrainAudioQueue_l(delayUs / 2);
+                postDrainAudioQueue_l(delayUs);
             }
             break;
         }
@@ -497,6 +612,19 @@ void NuPlayer::Renderer::onMessageReceived(const sp<AMessage> &msg) {
         case kWhatQueueEOS:
         {
             onQueueEOS(msg);
+            break;
+        }
+
+        case kWhatEOS:
+        {
+            int32_t generation;
+            CHECK(msg->findInt32("audioEOSGeneration", &generation));
+            if (generation != mAudioEOSGeneration) {
+                break;
+            }
+            status_t finalResult;
+            CHECK(msg->findInt32("finalResult", &finalResult));
+            notifyEOS(true /* audio */, finalResult);
             break;
         }
 
@@ -600,7 +728,10 @@ void NuPlayer::Renderer::onMessageReceived(const sp<AMessage> &msg) {
 
         case kWhatAudioTearDown:
         {
-            onAudioTearDown(kDueToError);
+            int32_t reason;
+            CHECK(msg->findInt32("reason", &reason));
+
+            onAudioTearDown((AudioTearDownReason)reason);
             break;
         }
 
@@ -687,19 +818,29 @@ size_t NuPlayer::Renderer::AudioSinkCallback(
         case MediaPlayerBase::AudioSink::CB_EVENT_STREAM_END:
         {
             ALOGV("AudioSink::CB_EVENT_STREAM_END");
-            me->notifyEOS(true /* audio */, ERROR_END_OF_STREAM);
+            me->notifyEOSCallback();
             break;
         }
 
         case MediaPlayerBase::AudioSink::CB_EVENT_TEAR_DOWN:
         {
             ALOGV("AudioSink::CB_EVENT_TEAR_DOWN");
-            me->notifyAudioTearDown();
+            me->notifyAudioTearDown(kDueToError);
             break;
         }
     }
 
     return 0;
+}
+
+void NuPlayer::Renderer::notifyEOSCallback() {
+    Mutex::Autolock autoLock(mLock);
+
+    if (!mUseAudioCallback) {
+        return;
+    }
+
+    notifyEOS_l(true /* audio */, ERROR_END_OF_STREAM);
 }
 
 size_t NuPlayer::Renderer::fillAudioBuffer(void *buffer, size_t size) {
@@ -755,7 +896,7 @@ size_t NuPlayer::Renderer::fillAudioBuffer(void *buffer, size_t size) {
     if (mAudioFirstAnchorTimeMediaUs >= 0) {
         int64_t nowUs = ALooper::GetNowUs();
         int64_t nowMediaUs =
-            mAudioFirstAnchorTimeMediaUs + getPlayedOutAudioDurationUs(nowUs);
+            mAudioFirstAnchorTimeMediaUs + mAudioSink->getPlayedOutDurationUs(nowUs);
         // we don't know how much data we are queueing for offloaded tracks.
         mMediaClock->updateAnchor(nowMediaUs, nowUs, INT64_MAX);
     }
@@ -776,10 +917,10 @@ size_t NuPlayer::Renderer::fillAudioBuffer(void *buffer, size_t size) {
             if (mAudioSink->needsTrailingPadding()) {
                 postEOSDelayUs = getPendingAudioPlayoutDurationUs(ALooper::GetNowUs());
             }
-            ALOGV("fillAudioBuffer: notifyEOS "
+            ALOGV("fillAudioBuffer: notifyEOS_l "
                     "mNumFramesWritten:%u  finalResult:%d  postEOSDelay:%lld",
                     mNumFramesWritten, entry->mFinalResult, (long long)postEOSDelayUs);
-            notifyEOS(true /* audio */, entry->mFinalResult, postEOSDelayUs);
+            notifyEOS_l(true /* audio */, entry->mFinalResult, postEOSDelayUs);
         }
     }
     return sizeCopied;
@@ -791,7 +932,7 @@ void NuPlayer::Renderer::drainAudioQueueUntilLastEOS() {
     while (it != mAudioQueue.end()) {
         int32_t eos;
         QueueEntry *entry = &*it++;
-        if (entry->mBuffer == NULL
+        if ((entry->mBuffer == nullptr && entry->mNotifyConsumed == nullptr)
                 || (entry->mNotifyConsumed->findInt32("eos", &eos) && eos != 0)) {
             itEOS = it;
             foundEOS = true;
@@ -801,9 +942,14 @@ void NuPlayer::Renderer::drainAudioQueueUntilLastEOS() {
     if (foundEOS) {
         // post all replies before EOS and drop the samples
         for (it = mAudioQueue.begin(); it != itEOS; it++) {
-            if (it->mBuffer == NULL) {
-                // delay doesn't matter as we don't even have an AudioTrack
-                notifyEOS(true /* audio */, it->mFinalResult);
+            if (it->mBuffer == nullptr) {
+                if (it->mNotifyConsumed == nullptr) {
+                    // delay doesn't matter as we don't even have an AudioTrack
+                    notifyEOS(true /* audio */, it->mFinalResult);
+                } else {
+                    // TAG for re-opening audio sink.
+                    onChangeAudioFormat(it->mMeta, it->mNotifyConsumed);
+                }
             } else {
                 it->mNotifyConsumed->post();
             }
@@ -855,15 +1001,28 @@ bool NuPlayer::Renderer::onDrainAudioQueue() {
     while (!mAudioQueue.empty()) {
         QueueEntry *entry = &*mAudioQueue.begin();
 
-        mLastAudioBufferDrained = entry->mBufferOrdinal;
-
         if (entry->mBuffer == NULL) {
+            if (entry->mNotifyConsumed != nullptr) {
+                // TAG for re-open audio sink.
+                onChangeAudioFormat(entry->mMeta, entry->mNotifyConsumed);
+                mAudioQueue.erase(mAudioQueue.begin());
+                continue;
+            }
+
             // EOS
+            if (mPaused) {
+                // Do not notify EOS when paused.
+                // This is needed to avoid switch to next clip while in pause.
+                ALOGV("onDrainAudioQueue(): Do not notify EOS when paused");
+                return false;
+            }
+
             int64_t postEOSDelayUs = 0;
             if (mAudioSink->needsTrailingPadding()) {
                 postEOSDelayUs = getPendingAudioPlayoutDurationUs(ALooper::GetNowUs());
             }
             notifyEOS(true /* audio */, entry->mFinalResult, postEOSDelayUs);
+            mLastAudioMediaTimeUs = getDurationUsIfPlayedAtSampleRate(mNumFramesWritten);
 
             mAudioQueue.erase(mAudioQueue.begin());
             entry = NULL;
@@ -876,6 +1035,8 @@ bool NuPlayer::Renderer::onDrainAudioQueue() {
             }
             return false;
         }
+
+        mLastAudioBufferDrained = entry->mBufferOrdinal;
 
         // ignore 0-sized buffer which could be EOS marker with no data
         if (entry->mOffset == 0 && entry->mBuffer->size() > 0) {
@@ -898,13 +1059,21 @@ bool NuPlayer::Renderer::onDrainAudioQueue() {
                 ALOGE("AudioSink write error(%zd) when writing %zu bytes", written, copy);
                 // This can only happen when AudioSink was opened with doNotReconnect flag set to
                 // true, in which case the NuPlayer will handle the reconnect.
-                notifyAudioTearDown();
+                notifyAudioTearDown(kDueToError);
             }
             break;
         }
 
         entry->mOffset += written;
-        if (entry->mOffset == entry->mBuffer->size()) {
+        size_t remainder = entry->mBuffer->size() - entry->mOffset;
+        if ((ssize_t)remainder < mAudioSink->frameSize()) {
+            if (remainder > 0) {
+                ALOGW("Corrupted audio buffer has fractional frames, discarding %zu bytes.",
+                        remainder);
+                entry->mOffset += remainder;
+                copy -= remainder;
+            }
+
             entry->mNotifyConsumed->post();
             mAudioQueue.erase(mAudioQueue.begin());
 
@@ -932,7 +1101,8 @@ bool NuPlayer::Renderer::onDrainAudioQueue() {
             // AudioSink write is called in non-blocking mode.
             // It may return with a short count when:
             //
-            // 1) Size to be copied is not a multiple of the frame size. We consider this fatal.
+            // 1) Size to be copied is not a multiple of the frame size. Fractional frames are
+            //    discarded.
             // 2) The data to be copied exceeds the available buffer in AudioSink.
             // 3) An error occurs and data has been partially copied to the buffer in AudioSink.
             // 4) AudioSink is an AudioCache for data retrieval, and the AudioCache is exceeded.
@@ -940,7 +1110,7 @@ bool NuPlayer::Renderer::onDrainAudioQueue() {
             // (Case 1)
             // Must be a multiple of the frame size.  If it is not a multiple of a frame size, it
             // needs to fail, as we should not carry over fractional frames between calls.
-            CHECK_EQ(copy % mAudioSink->frameSize(), 0);
+            CHECK_EQ(copy % mAudioSink->frameSize(), 0u);
 
             // (Case 2, 3, 4)
             // Return early to the caller.
@@ -973,7 +1143,27 @@ int64_t NuPlayer::Renderer::getDurationUsIfPlayedAtSampleRate(uint32_t numFrames
 // Calculate duration of pending samples if played at normal rate (i.e., 1.0).
 int64_t NuPlayer::Renderer::getPendingAudioPlayoutDurationUs(int64_t nowUs) {
     int64_t writtenAudioDurationUs = getDurationUsIfPlayedAtSampleRate(mNumFramesWritten);
-    return writtenAudioDurationUs - getPlayedOutAudioDurationUs(nowUs);
+    if (mUseVirtualAudioSink) {
+        int64_t nowUs = ALooper::GetNowUs();
+        int64_t mediaUs;
+        if (mMediaClock->getMediaTime(nowUs, &mediaUs) != OK) {
+            return 0ll;
+        } else {
+            return writtenAudioDurationUs - (mediaUs - mAudioFirstAnchorTimeMediaUs);
+        }
+    }
+
+    const int64_t audioSinkPlayedUs = mAudioSink->getPlayedOutDurationUs(nowUs);
+    int64_t pendingUs = writtenAudioDurationUs - audioSinkPlayedUs;
+    if (pendingUs < 0) {
+        // This shouldn't happen unless the timestamp is stale.
+        ALOGW("%s: pendingUs %lld < 0, clamping to zero, potential resume after pause "
+                "writtenAudioDurationUs: %lld, audioSinkPlayedUs: %lld",
+                __func__, (long long)pendingUs,
+                (long long)writtenAudioDurationUs, (long long)audioSinkPlayedUs);
+        pendingUs = 0;
+    }
+    return pendingUs;
 }
 
 int64_t NuPlayer::Renderer::getRealTimeUs(int64_t mediaTimeUs, int64_t nowUs) {
@@ -994,9 +1184,39 @@ void NuPlayer::Renderer::onNewAudioMediaTime(int64_t mediaTimeUs) {
         return;
     }
     setAudioFirstAnchorTimeIfNeeded_l(mediaTimeUs);
+
+    // mNextAudioClockUpdateTimeUs is -1 if we're waiting for audio sink to start
+    if (mNextAudioClockUpdateTimeUs == -1) {
+        AudioTimestamp ts;
+        if (mAudioSink->getTimestamp(ts) == OK && ts.mPosition > 0) {
+            mNextAudioClockUpdateTimeUs = 0; // start our clock updates
+        }
+    }
     int64_t nowUs = ALooper::GetNowUs();
-    int64_t nowMediaUs = mediaTimeUs - getPendingAudioPlayoutDurationUs(nowUs);
-    mMediaClock->updateAnchor(nowMediaUs, nowUs, mediaTimeUs);
+    if (mNextAudioClockUpdateTimeUs >= 0) {
+        if (nowUs >= mNextAudioClockUpdateTimeUs) {
+            int64_t nowMediaUs = mediaTimeUs - getPendingAudioPlayoutDurationUs(nowUs);
+            mMediaClock->updateAnchor(nowMediaUs, nowUs, mediaTimeUs);
+            mUseVirtualAudioSink = false;
+            mNextAudioClockUpdateTimeUs = nowUs + kMinimumAudioClockUpdatePeriodUs;
+        }
+    } else {
+        int64_t unused;
+        if ((mMediaClock->getMediaTime(nowUs, &unused) != OK)
+                && (getDurationUsIfPlayedAtSampleRate(mNumFramesWritten)
+                        > kMaxAllowedAudioSinkDelayUs)) {
+            // Enough data has been sent to AudioSink, but AudioSink has not rendered
+            // any data yet. Something is wrong with AudioSink, e.g., the device is not
+            // connected to audio out.
+            // Switch to system clock. This essentially creates a virtual AudioSink with
+            // initial latenty of getDurationUsIfPlayedAtSampleRate(mNumFramesWritten).
+            // This virtual AudioSink renders audio data starting from the very first sample
+            // and it's paced by system clock.
+            ALOGW("AudioSink stuck. ARE YOU CONNECTED TO AUDIO OUT? Switching to system clock.");
+            mMediaClock->updateAnchor(mAudioFirstAnchorTimeMediaUs, nowUs, mediaTimeUs);
+            mUseVirtualAudioSink = true;
+        }
+    }
     mAnchorNumFramesWritten = mNumFramesWritten;
     mAnchorTimeMediaUs = mediaTimeUs;
 }
@@ -1025,6 +1245,7 @@ void NuPlayer::Renderer::postDrainVideoQueue() {
         return;
     }
 
+    bool needRepostDrainVideoQueue = false;
     int64_t delayUs;
     int64_t nowUs = ALooper::GetNowUs();
     int64_t realTimeUs;
@@ -1042,8 +1263,17 @@ void NuPlayer::Renderer::postDrainVideoQueue() {
                 mMediaClock->updateAnchor(mediaTimeUs, nowUs, mediaTimeUs);
                 mAnchorTimeMediaUs = mediaTimeUs;
                 realTimeUs = nowUs;
-            } else {
+            } else if (!mVideoSampleReceived) {
+                // Always render the first video frame.
+                realTimeUs = nowUs;
+            } else if (mAudioFirstAnchorTimeMediaUs < 0
+                || mMediaClock->getRealTimeFor(mediaTimeUs, &realTimeUs) == OK) {
                 realTimeUs = getRealTimeUs(mediaTimeUs, nowUs);
+            } else if (mediaTimeUs - mAudioFirstAnchorTimeMediaUs >= 0) {
+                needRepostDrainVideoQueue = true;
+                realTimeUs = nowUs;
+            } else {
+                realTimeUs = nowUs;
             }
         }
         if (!mHasAudio) {
@@ -1056,16 +1286,28 @@ void NuPlayer::Renderer::postDrainVideoQueue() {
         // received after this buffer, repost in 10 msec. Otherwise repost
         // in 500 msec.
         delayUs = realTimeUs - nowUs;
+        int64_t postDelayUs = -1;
         if (delayUs > 500000) {
-            int64_t postDelayUs = 500000;
+            postDelayUs = 500000;
             if (mHasAudio && (mLastAudioBufferDrained - entry.mBufferOrdinal) <= 0) {
                 postDelayUs = 10000;
             }
+        } else if (needRepostDrainVideoQueue) {
+            // CHECK(mPlaybackRate > 0);
+            // CHECK(mAudioFirstAnchorTimeMediaUs >= 0);
+            // CHECK(mediaTimeUs - mAudioFirstAnchorTimeMediaUs >= 0);
+            postDelayUs = mediaTimeUs - mAudioFirstAnchorTimeMediaUs;
+            postDelayUs /= mPlaybackRate;
+        }
+
+        if (postDelayUs >= 0) {
             msg->setWhat(kWhatPostDrainVideoQueue);
             msg->post(postDelayUs);
             mVideoScheduler->restart();
-            ALOGI("possible video time jump of %dms, retrying in %dms",
-                    (int)(delayUs / 1000), (int)(postDelayUs / 1000));
+            ALOGI("possible video time jump of %dms (%lld : %lld) or uninitialized media clock,"
+                    " retrying in %dms",
+                    (int)(delayUs / 1000), (long long)mediaTimeUs,
+                    (long long)mAudioFirstAnchorTimeMediaUs, (int)(postDelayUs / 1000));
             mDrainVideoQueuePending = true;
             return;
         }
@@ -1102,24 +1344,20 @@ void NuPlayer::Renderer::onDrainVideoQueue() {
         return;
     }
 
-    int64_t nowUs = -1;
+    int64_t nowUs = ALooper::GetNowUs();
     int64_t realTimeUs;
+    int64_t mediaTimeUs = -1;
     if (mFlags & FLAG_REAL_TIME) {
         CHECK(entry->mBuffer->meta()->findInt64("timeUs", &realTimeUs));
     } else {
-        int64_t mediaTimeUs;
         CHECK(entry->mBuffer->meta()->findInt64("timeUs", &mediaTimeUs));
 
-        nowUs = ALooper::GetNowUs();
         realTimeUs = getRealTimeUs(mediaTimeUs, nowUs);
     }
 
     bool tooLate = false;
 
     if (!mPaused) {
-        if (nowUs == -1) {
-            nowUs = ALooper::GetNowUs();
-        }
         setVideoLateByUs(nowUs - realTimeUs);
         tooLate = (mVideoLateByUs > 40000);
 
@@ -1132,15 +1370,28 @@ void NuPlayer::Renderer::onDrainVideoQueue() {
             ALOGV("rendering video at media time %.2f secs",
                     (mFlags & FLAG_REAL_TIME ? realTimeUs :
                     mediaUs) / 1E6);
+
+            if (!(mFlags & FLAG_REAL_TIME)
+                    && mLastAudioMediaTimeUs != -1
+                    && mediaTimeUs > mLastAudioMediaTimeUs) {
+                // If audio ends before video, video continues to drive media clock.
+                // Also smooth out videos >= 10fps.
+                mMediaClock->updateMaxTimeMedia(mediaTimeUs + 100000);
+            }
         }
     } else {
         setVideoLateByUs(0);
         if (!mVideoSampleReceived && !mHasAudio) {
             // This will ensure that the first frame after a flush won't be used as anchor
             // when renderer is in paused state, because resume can happen any time after seek.
-            Mutex::Autolock autoLock(mLock);
-            clearAnchorTime_l();
+            clearAnchorTime();
         }
+    }
+
+    // Always render the first video frame while keeping stats on A/V sync.
+    if (!mVideoSampleReceived) {
+        realTimeUs = nowUs;
+        tooLate = false;
     }
 
     entry->mNotifyConsumed->setInt64("timestampNs", realTimeUs * 1000ll);
@@ -1168,15 +1419,34 @@ void NuPlayer::Renderer::notifyVideoRenderingStart() {
 }
 
 void NuPlayer::Renderer::notifyEOS(bool audio, status_t finalResult, int64_t delayUs) {
+    Mutex::Autolock autoLock(mLock);
+    notifyEOS_l(audio, finalResult, delayUs);
+}
+
+void NuPlayer::Renderer::notifyEOS_l(bool audio, status_t finalResult, int64_t delayUs) {
+    if (audio && delayUs > 0) {
+        sp<AMessage> msg = new AMessage(kWhatEOS, this);
+        msg->setInt32("audioEOSGeneration", mAudioEOSGeneration);
+        msg->setInt32("finalResult", finalResult);
+        msg->post(delayUs);
+        return;
+    }
     sp<AMessage> notify = mNotify->dup();
     notify->setInt32("what", kWhatEOS);
     notify->setInt32("audio", static_cast<int32_t>(audio));
     notify->setInt32("finalResult", finalResult);
     notify->post(delayUs);
+
+    if (audio) {
+        // Video might outlive audio. Clear anchor to enable video only case.
+        mAnchorTimeMediaUs = -1;
+    }
 }
 
-void NuPlayer::Renderer::notifyAudioTearDown() {
-    (new AMessage(kWhatAudioTearDown, this))->post();
+void NuPlayer::Renderer::notifyAudioTearDown(AudioTearDownReason reason) {
+    sp<AMessage> msg = new AMessage(kWhatAudioTearDown, this);
+    msg->setInt32("reason", reason);
+    msg->post();
 }
 
 void NuPlayer::Renderer::onQueueBuffer(const sp<AMessage> &msg) {
@@ -1200,8 +1470,9 @@ void NuPlayer::Renderer::onQueueBuffer(const sp<AMessage> &msg) {
         }
     }
 
-    sp<ABuffer> buffer;
-    CHECK(msg->findBuffer("buffer", &buffer));
+    sp<RefBase> obj;
+    CHECK(msg->findObject("buffer", &obj));
+    sp<MediaCodecBuffer> buffer = static_cast<MediaCodecBuffer *>(obj.get());
 
     sp<AMessage> notifyConsumed;
     CHECK(msg->findMessage("notifyConsumed", &notifyConsumed));
@@ -1227,8 +1498,8 @@ void NuPlayer::Renderer::onQueueBuffer(const sp<AMessage> &msg) {
         return;
     }
 
-    sp<ABuffer> firstAudioBuffer = (*mAudioQueue.begin()).mBuffer;
-    sp<ABuffer> firstVideoBuffer = (*mVideoQueue.begin()).mBuffer;
+    sp<MediaCodecBuffer> firstAudioBuffer = (*mAudioQueue.begin()).mBuffer;
+    sp<MediaCodecBuffer> firstVideoBuffer = (*mVideoQueue.begin()).mBuffer;
 
     if (firstAudioBuffer == NULL || firstVideoBuffer == NULL) {
         // EOS signalled on either queue.
@@ -1318,6 +1589,7 @@ void NuPlayer::Renderer::onFlush(const sp<AMessage> &msg) {
         if (audio) {
             notifyComplete = mNotifyCompleteAudio;
             mNotifyCompleteAudio = false;
+            mLastAudioMediaTimeUs = -1;
         } else {
             notifyComplete = mNotifyCompleteVideo;
             mNotifyCompleteVideo = false;
@@ -1332,8 +1604,8 @@ void NuPlayer::Renderer::onFlush(const sp<AMessage> &msg) {
         // Therefore we'll stop syncing the queues if at least one of them
         // is flushed.
         syncQueuesDone_l();
-        clearAnchorTime_l();
     }
+    clearAnchorTime();
 
     ALOGV("flushing %s", audio ? "audio" : "video");
     if (audio) {
@@ -1342,6 +1614,7 @@ void NuPlayer::Renderer::onFlush(const sp<AMessage> &msg) {
             flushQueue(&mAudioQueue);
 
             ++mAudioDrainGeneration;
+            ++mAudioEOSGeneration;
             prepareForMediaRenderingStart_l();
 
             // the frame count will be reset after flush.
@@ -1375,6 +1648,7 @@ void NuPlayer::Renderer::onFlush(const sp<AMessage> &msg) {
             }
             mNumFramesWritten = 0;
         }
+        mNextAudioClockUpdateTimeUs = -1;
     } else {
         flushQueue(&mVideoQueue);
 
@@ -1402,6 +1676,9 @@ void NuPlayer::Renderer::flushQueue(List<QueueEntry> *queue) {
 
         if (entry->mBuffer != NULL) {
             entry->mNotifyConsumed->post();
+        } else if (entry->mNotifyConsumed != nullptr) {
+            // Is it needed to open audio sink now?
+            onChangeAudioFormat(entry->mMeta, entry->mNotifyConsumed);
         }
 
         queue->erase(queue->begin());
@@ -1439,10 +1716,7 @@ void NuPlayer::Renderer::onAudioSinkChanged() {
     }
     CHECK(!mDrainAudioQueuePending);
     mNumFramesWritten = 0;
-    {
-        Mutex::Autolock autoLock(mLock);
-        mAnchorNumFramesWritten = -1;
-    }
+    mAnchorNumFramesWritten = -1;
     uint32_t written;
     if (mAudioSink->getFramesWritten(&written) == OK) {
         mNumFramesWritten = written;
@@ -1484,10 +1758,9 @@ void NuPlayer::Renderer::onPause() {
     mDrainAudioQueuePending = false;
     mDrainVideoQueuePending = false;
 
-    if (mHasAudio) {
-        mAudioSink->pause();
-        startAudioOffloadPauseTimeout();
-    }
+    // Note: audio data may not have been decoded, and the AudioSink may not be opened.
+    mAudioSink->pause();
+    startAudioOffloadPauseTimeout();
 
     ALOGV("now paused audio queue has %zu entries, video has %zu entries",
           mAudioQueue.size(), mVideoQueue.size());
@@ -1498,12 +1771,13 @@ void NuPlayer::Renderer::onResume() {
         return;
     }
 
-    if (mHasAudio) {
-        cancelAudioOffloadPauseTimeout();
+    // Note: audio data may not have been decoded, and the AudioSink may not be opened.
+    cancelAudioOffloadPauseTimeout();
+    if (mAudioSink->ready()) {
         status_t err = mAudioSink->start();
         if (err != OK) {
             ALOGE("cannot start AudioSink err %d", err);
-            notifyAudioTearDown();
+            notifyAudioTearDown(kDueToError);
         }
     }
 
@@ -1553,70 +1827,6 @@ bool NuPlayer::Renderer::getSyncQueues() {
     return mSyncQueues;
 }
 
-// TODO: Remove unnecessary calls to getPlayedOutAudioDurationUs()
-// as it acquires locks and may query the audio driver.
-//
-// Some calls could conceivably retrieve extrapolated data instead of
-// accessing getTimestamp() or getPosition() every time a data buffer with
-// a media time is received.
-//
-// Calculate duration of played samples if played at normal rate (i.e., 1.0).
-int64_t NuPlayer::Renderer::getPlayedOutAudioDurationUs(int64_t nowUs) {
-    uint32_t numFramesPlayed;
-    int64_t numFramesPlayedAt;
-    AudioTimestamp ts;
-    static const int64_t kStaleTimestamp100ms = 100000;
-
-    status_t res = mAudioSink->getTimestamp(ts);
-    if (res == OK) {                 // case 1: mixing audio tracks and offloaded tracks.
-        numFramesPlayed = ts.mPosition;
-        numFramesPlayedAt =
-            ts.mTime.tv_sec * 1000000LL + ts.mTime.tv_nsec / 1000;
-        const int64_t timestampAge = nowUs - numFramesPlayedAt;
-        if (timestampAge > kStaleTimestamp100ms) {
-            // This is an audio FIXME.
-            // getTimestamp returns a timestamp which may come from audio mixing threads.
-            // After pausing, the MixerThread may go idle, thus the mTime estimate may
-            // become stale. Assuming that the MixerThread runs 20ms, with FastMixer at 5ms,
-            // the max latency should be about 25ms with an average around 12ms (to be verified).
-            // For safety we use 100ms.
-            ALOGV("getTimestamp: returned stale timestamp nowUs(%lld) numFramesPlayedAt(%lld)",
-                    (long long)nowUs, (long long)numFramesPlayedAt);
-            numFramesPlayedAt = nowUs - kStaleTimestamp100ms;
-        }
-        //ALOGD("getTimestamp: OK %d %lld", numFramesPlayed, (long long)numFramesPlayedAt);
-    } else if (res == WOULD_BLOCK) { // case 2: transitory state on start of a new track
-        numFramesPlayed = 0;
-        numFramesPlayedAt = nowUs;
-        //ALOGD("getTimestamp: WOULD_BLOCK %d %lld",
-        //        numFramesPlayed, (long long)numFramesPlayedAt);
-    } else {                         // case 3: transitory at new track or audio fast tracks.
-        res = mAudioSink->getPosition(&numFramesPlayed);
-        CHECK_EQ(res, (status_t)OK);
-        numFramesPlayedAt = nowUs;
-        numFramesPlayedAt += 1000LL * mAudioSink->latency() / 2; /* XXX */
-        //ALOGD("getPosition: %u %lld", numFramesPlayed, (long long)numFramesPlayedAt);
-    }
-
-    //CHECK_EQ(numFramesPlayed & (1 << 31), 0);  // can't be negative until 12.4 hrs, test
-    int64_t durationUs = getDurationUsIfPlayedAtSampleRate(numFramesPlayed)
-            + nowUs - numFramesPlayedAt;
-    if (durationUs < 0) {
-        // Occurs when numFramesPlayed position is very small and the following:
-        // (1) In case 1, the time nowUs is computed before getTimestamp() is called and
-        //     numFramesPlayedAt is greater than nowUs by time more than numFramesPlayed.
-        // (2) In case 3, using getPosition and adding mAudioSink->latency() to
-        //     numFramesPlayedAt, by a time amount greater than numFramesPlayed.
-        //
-        // Both of these are transitory conditions.
-        ALOGV("getPlayedOutAudioDurationUs: negative duration %lld set to zero", (long long)durationUs);
-        durationUs = 0;
-    }
-    ALOGV("getPlayedOutAudioDurationUs(%lld) nowUs(%lld) frames(%u) framesAt(%lld)",
-            (long long)durationUs, (long long)nowUs, numFramesPlayed, (long long)numFramesPlayedAt);
-    return durationUs;
-}
-
 void NuPlayer::Renderer::onAudioTearDown(AudioTearDownReason reason) {
     if (mAudioTornDown) {
         return;
@@ -1647,17 +1857,24 @@ void NuPlayer::Renderer::startAudioOffloadPauseTimeout() {
 }
 
 void NuPlayer::Renderer::cancelAudioOffloadPauseTimeout() {
-    if (offloadingAudio()) {
-        mWakeLock->release(true);
-        ++mAudioOffloadPauseTimeoutGeneration;
-    }
+    // We may have called startAudioOffloadPauseTimeout() without
+    // the AudioSink open and with offloadingAudio enabled.
+    //
+    // When we cancel, it may be that offloadingAudio is subsequently disabled, so regardless
+    // we always release the wakelock and increment the pause timeout generation.
+    //
+    // Note: The acquired wakelock prevents the device from suspending
+    // immediately after offload pause (in case a resume happens shortly thereafter).
+    mWakeLock->release(true);
+    ++mAudioOffloadPauseTimeoutGeneration;
 }
 
 status_t NuPlayer::Renderer::onOpenAudioSink(
         const sp<AMessage> &format,
         bool offloadOnly,
         bool hasVideo,
-        uint32_t flags) {
+        uint32_t flags,
+        bool isStreaming) {
     ALOGV("openAudioSink: offloadOnly(%d) offloadingAudio(%d)",
             offloadOnly, offloadingAudio());
     bool audioSinkChanged = false;
@@ -1689,7 +1906,7 @@ status_t NuPlayer::Renderer::onOpenAudioSink(
                     mime.c_str(), audioFormat);
 
             int avgBitRate = -1;
-            format->findInt32("bit-rate", &avgBitRate);
+            format->findInt32("bitrate", &avgBitRate);
 
             int32_t aacProfile = -1;
             if (audioFormat == AUDIO_FORMAT_AAC
@@ -1710,7 +1927,7 @@ status_t NuPlayer::Renderer::onOpenAudioSink(
             offloadInfo.stream_type = AUDIO_STREAM_MUSIC;
             offloadInfo.bit_rate = avgBitRate;
             offloadInfo.has_video = hasVideo;
-            offloadInfo.is_streaming = true;
+            offloadInfo.is_streaming = isStreaming;
 
             if (memcmp(&mCurrentOffloadInfo, &offloadInfo, sizeof(offloadInfo)) == 0) {
                 ALOGV("openAudioSink: no change in offload mode");
@@ -1760,6 +1977,9 @@ status_t NuPlayer::Renderer::onOpenAudioSink(
                 onDisableOffloadAudio();
                 mCurrentOffloadInfo = AUDIO_INFO_INITIALIZER;
                 ALOGV("openAudioSink: offload failed");
+                if (offloadOnly) {
+                    notifyAudioTearDown(kForceNonOffload);
+                }
             } else {
                 mUseAudioCallback = true;  // offload mode transfers data through callback
                 ++mAudioDrainGeneration;  // discard pending kWhatDrainAudioQueue message.
@@ -1805,6 +2025,10 @@ status_t NuPlayer::Renderer::onOpenAudioSink(
         // NuPlayer a chance to switch from non-offload mode to offload mode.
         // So we only set doNotReconnect when there's no video.
         const bool doNotReconnect = !hasVideo;
+
+        // We should always be able to set our playback settings if the sink is closed.
+        LOG_ALWAYS_FATAL_IF(mAudioSink->setPlaybackRate(mPlaybackSettings) != OK,
+                "onOpenAudioSink: can't set playback rate on closed sink");
         status_t err = mAudioSink->open(
                     sampleRate,
                     numChannels,
@@ -1817,9 +2041,6 @@ status_t NuPlayer::Renderer::onOpenAudioSink(
                     NULL,
                     doNotReconnect,
                     frameCount);
-        if (err == OK) {
-            err = mAudioSink->setPlaybackRate(mPlaybackSettings);
-        }
         if (err != OK) {
             ALOGW("openAudioSink: non offloaded open failed status: %d", err);
             mAudioSink->close();
@@ -1842,6 +2063,31 @@ void NuPlayer::Renderer::onCloseAudioSink() {
     mAudioSink->close();
     mCurrentOffloadInfo = AUDIO_INFO_INITIALIZER;
     mCurrentPcmInfo = AUDIO_PCMINFO_INITIALIZER;
+}
+
+void NuPlayer::Renderer::onChangeAudioFormat(
+        const sp<AMessage> &meta, const sp<AMessage> &notify) {
+    sp<AMessage> format;
+    CHECK(meta->findMessage("format", &format));
+
+    int32_t offloadOnly;
+    CHECK(meta->findInt32("offload-only", &offloadOnly));
+
+    int32_t hasVideo;
+    CHECK(meta->findInt32("has-video", &hasVideo));
+
+    uint32_t flags;
+    CHECK(meta->findInt32("flags", (int32_t *)&flags));
+
+    uint32_t isStreaming;
+    CHECK(meta->findInt32("isStreaming", (int32_t *)&isStreaming));
+
+    status_t err = onOpenAudioSink(format, offloadOnly, hasVideo, flags, isStreaming);
+
+    if (err != OK) {
+        notify->setInt32("err", err);
+    }
+    notify->post();
 }
 
 }  // namespace android

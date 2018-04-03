@@ -22,10 +22,12 @@
 #include "Configuration.h"
 #include <linux/futex.h>
 #include <sys/syscall.h>
+#include <cutils/atomic.h>
 #include <utils/Log.h>
 #include <utils/Trace.h>
 #include "FastThread.h"
 #include "FastThreadDumpState.h"
+#include "TypedLogger.h"
 
 #define FAST_DEFAULT_NS    999999999L   // ~1 sec: default time to sleep
 #define FAST_HOT_IDLE_NS     1000000L   // 1 ms: time to sleep while hot idling
@@ -35,7 +37,7 @@
 
 namespace android {
 
-FastThread::FastThread() : Thread(false /*canCallJava*/),
+FastThread::FastThread(const char *cycleMs, const char *loadUs) : Thread(false /*canCallJava*/),
     // re-initialized to &sInitial by subclass constructor
     mPrevious(NULL), mCurrent(NULL),
     /* mOldTs({0, 0}), */
@@ -63,8 +65,8 @@ FastThread::FastThread() : Thread(false /*canCallJava*/),
     /* mMeasuredWarmupTs({0, 0}), */
     mWarmupCycles(0),
     mWarmupConsecutiveInRangeCycles(0),
-    // mDummyLogWriter
-    mLogWriter(&mDummyLogWriter),
+    // mDummyNBLogWriter
+    mNBLogWriter(&mDummyNBLogWriter),
     mTimestampStatus(INVALID_OPERATION),
 
     mCommand(FastThreadState::INITIAL),
@@ -72,11 +74,15 @@ FastThread::FastThread() : Thread(false /*canCallJava*/),
     frameCount(0),
 #endif
     mAttemptedWrite(false)
+    // mCycleMs(cycleMs)
+    // mLoadUs(loadUs)
 {
     mOldTs.tv_sec = 0;
     mOldTs.tv_nsec = 0;
     mMeasuredWarmupTs.tv_sec = 0;
     mMeasuredWarmupTs.tv_nsec = 0;
+    strlcpy(mCycleMs, cycleMs, sizeof(mCycleMs));
+    strlcpy(mLoadUs, loadUs, sizeof(mLoadUs));
 }
 
 FastThread::~FastThread()
@@ -85,6 +91,9 @@ FastThread::~FastThread()
 
 bool FastThread::threadLoop()
 {
+    // LOGT now works even if tlNBLogWriter is nullptr, but we're considering changing that,
+    // so this initialization permits a future change to remove the check for nullptr.
+    tlNBLogWriter = &mDummyNBLogWriter;
     for (;;) {
 
         // either nanosleep, sched_yield, or busy wait
@@ -114,8 +123,9 @@ bool FastThread::threadLoop()
 
             // As soon as possible of learning of a new dump area, start using it
             mDumpState = next->mDumpState != NULL ? next->mDumpState : mDummyDumpState;
-            mLogWriter = next->mNBLogWriter != NULL ? next->mNBLogWriter : &mDummyLogWriter;
-            setLog(mLogWriter);
+            mNBLogWriter = next->mNBLogWriter != NULL ? next->mNBLogWriter : &mDummyNBLogWriter;
+            setNBLogWriter(mNBLogWriter);   // FastMixer informs its AudioMixer, FastCapture ignores
+            tlNBLogWriter = mNBLogWriter;
 
             // We want to always have a valid reference to the previous (non-idle) state.
             // However, the state queue only guarantees access to current and previous states.
@@ -163,9 +173,9 @@ bool FastThread::threadLoop()
                 if (old <= 0) {
                     syscall(__NR_futex, coldFutexAddr, FUTEX_WAIT_PRIVATE, old - 1, NULL);
                 }
-                int policy = sched_getscheduler(0);
+                int policy = sched_getscheduler(0) & ~SCHED_RESET_ON_FORK;
                 if (!(policy == SCHED_FIFO || policy == SCHED_RR)) {
-                    ALOGE("did not receive expected priority boost");
+                    ALOGE("did not receive expected priority boost on time");
                 }
                 // This may be overly conservative; there could be times that the normal mixer
                 // requests such a brief cold idle that it doesn't require resetting this flag.
@@ -213,7 +223,6 @@ bool FastThread::threadLoop()
         struct timespec newTs;
         int rc = clock_gettime(CLOCK_MONOTONIC, &newTs);
         if (rc == 0) {
-            //mLogWriter->logTimestamp(newTs);
             if (mOldTsValid) {
                 time_t sec = newTs.tv_sec - mOldTs.tv_sec;
                 long nsec = newTs.tv_nsec - mOldTs.tv_nsec;
@@ -336,8 +345,8 @@ bool FastThread::threadLoop()
                     // this store #4 is not atomic with respect to stores #1, #2, #3 above, but
                     // the newest open & oldest closed halves are atomic with respect to each other
                     mDumpState->mBounds = mBounds;
-                    ATRACE_INT("cycle_ms", monotonicNs / 1000000);
-                    ATRACE_INT("load_us", loadNs / 1000);
+                    ATRACE_INT(mCycleMs, monotonicNs / 1000000);
+                    ATRACE_INT(mLoadUs, loadNs / 1000);
                 }
 #endif
             } else {

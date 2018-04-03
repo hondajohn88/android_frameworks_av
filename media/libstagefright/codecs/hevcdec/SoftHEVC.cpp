@@ -48,14 +48,6 @@ namespace android {
         (IVD_CONTROL_API_COMMAND_TYPE_T)IHEVCD_CXA_CMD_CTL_SET_NUM_CORES
 
 static const CodecProfileLevel kProfileLevels[] = {
-    { OMX_VIDEO_HEVCProfileMain, OMX_VIDEO_HEVCMainTierLevel1  },
-    { OMX_VIDEO_HEVCProfileMain, OMX_VIDEO_HEVCMainTierLevel2  },
-    { OMX_VIDEO_HEVCProfileMain, OMX_VIDEO_HEVCMainTierLevel21 },
-    { OMX_VIDEO_HEVCProfileMain, OMX_VIDEO_HEVCMainTierLevel3  },
-    { OMX_VIDEO_HEVCProfileMain, OMX_VIDEO_HEVCMainTierLevel31 },
-    { OMX_VIDEO_HEVCProfileMain, OMX_VIDEO_HEVCMainTierLevel4  },
-    { OMX_VIDEO_HEVCProfileMain, OMX_VIDEO_HEVCMainTierLevel41 },
-    { OMX_VIDEO_HEVCProfileMain, OMX_VIDEO_HEVCMainTierLevel5  },
     { OMX_VIDEO_HEVCProfileMain, OMX_VIDEO_HEVCMainTierLevel51 },
 };
 
@@ -182,6 +174,48 @@ status_t SoftHEVC::resetPlugin() {
     return OK;
 }
 
+bool SoftHEVC::getVUIParams() {
+    IV_API_CALL_STATUS_T status;
+    ihevcd_cxa_ctl_get_vui_params_ip_t s_ctl_get_vui_params_ip;
+    ihevcd_cxa_ctl_get_vui_params_op_t s_ctl_get_vui_params_op;
+
+    s_ctl_get_vui_params_ip.e_cmd = IVD_CMD_VIDEO_CTL;
+    s_ctl_get_vui_params_ip.e_sub_cmd =
+        (IVD_CONTROL_API_COMMAND_TYPE_T)IHEVCD_CXA_CMD_CTL_GET_VUI_PARAMS;
+
+    s_ctl_get_vui_params_ip.u4_size =
+        sizeof(ihevcd_cxa_ctl_get_vui_params_ip_t);
+
+    s_ctl_get_vui_params_op.u4_size = sizeof(ihevcd_cxa_ctl_get_vui_params_op_t);
+
+    status = ivdec_api_function(
+            (iv_obj_t *)mCodecCtx, (void *)&s_ctl_get_vui_params_ip,
+            (void *)&s_ctl_get_vui_params_op);
+
+    if (status != IV_SUCCESS) {
+        ALOGW("Error in getting VUI params: 0x%x",
+                s_ctl_get_vui_params_op.u4_error_code);
+        return false;
+    }
+
+    int32_t primaries = s_ctl_get_vui_params_op.u1_colour_primaries;
+    int32_t transfer = s_ctl_get_vui_params_op.u1_transfer_characteristics;
+    int32_t coeffs = s_ctl_get_vui_params_op.u1_matrix_coefficients;
+    bool fullRange = s_ctl_get_vui_params_op.u1_video_full_range_flag;
+
+    ColorAspects colorAspects;
+    ColorUtils::convertIsoColorAspectsToCodecAspects(
+            primaries, transfer, coeffs, fullRange, colorAspects);
+
+    // Update color aspects if necessary.
+    if (colorAspectsDiffer(colorAspects, mBitstreamColorAspects)) {
+        mBitstreamColorAspects = colorAspects;
+        status_t err = handleColorAspectsChange();
+        CHECK(err == OK);
+    }
+    return true;
+}
+
 status_t SoftHEVC::resetDecoder() {
     ivd_ctl_reset_ip_t s_ctl_ip;
     ivd_ctl_reset_op_t s_ctl_op;
@@ -278,10 +312,6 @@ status_t SoftHEVC::initDecoder() {
 
         status = ivdec_api_function(mCodecCtx, (void *)&s_create_ip, (void *)&s_create_op);
 
-        mCodecCtx = (iv_obj_t*)s_create_op.s_ivd_create_op_t.pv_handle;
-        mCodecCtx->pv_fxns = dec_fxns;
-        mCodecCtx->u4_size = sizeof(iv_obj_t);
-
         if (status != IV_SUCCESS) {
             ALOGE("Error in create: 0x%x",
                     s_create_op.s_ivd_create_op_t.u4_error_code);
@@ -289,6 +319,10 @@ status_t SoftHEVC::initDecoder() {
             mCodecCtx = NULL;
             return UNKNOWN_ERROR;
         }
+
+        mCodecCtx = (iv_obj_t*)s_create_op.s_ivd_create_op_t.pv_handle;
+        mCodecCtx->pv_fxns = dec_fxns;
+        mCodecCtx->u4_size = sizeof(iv_obj_t);
     }
 
     /* Reset the plugin state */
@@ -343,14 +377,13 @@ void SoftHEVC::onReset() {
     resetPlugin();
 }
 
-void SoftHEVC::setDecodeArgs(ivd_video_decode_ip_t *ps_dec_ip,
+bool SoftHEVC::setDecodeArgs(ivd_video_decode_ip_t *ps_dec_ip,
         ivd_video_decode_op_t *ps_dec_op,
         OMX_BUFFERHEADERTYPE *inHeader,
         OMX_BUFFERHEADERTYPE *outHeader,
         size_t timeStampIx) {
     size_t sizeY = outputBufferWidth() * outputBufferHeight();
     size_t sizeUV;
-    uint8_t *pBuf;
 
     ps_dec_ip->u4_size = sizeof(ivd_video_decode_ip_t);
     ps_dec_op->u4_size = sizeof(ivd_video_decode_op_t);
@@ -370,22 +403,28 @@ void SoftHEVC::setDecodeArgs(ivd_video_decode_ip_t *ps_dec_ip,
         ps_dec_ip->u4_num_Bytes = 0;
     }
 
-    if (outHeader) {
-        pBuf = outHeader->pBuffer;
-    } else {
-        pBuf = mFlushOutBuffer;
-    }
-
     sizeUV = sizeY / 4;
     ps_dec_ip->s_out_buffer.u4_min_out_buf_size[0] = sizeY;
     ps_dec_ip->s_out_buffer.u4_min_out_buf_size[1] = sizeUV;
     ps_dec_ip->s_out_buffer.u4_min_out_buf_size[2] = sizeUV;
 
+    uint8_t *pBuf;
+    if (outHeader) {
+        if (outHeader->nAllocLen < sizeY + (sizeUV * 2)) {
+            android_errorWriteLog(0x534e4554, "27833616");
+            return false;
+        }
+        pBuf = outHeader->pBuffer;
+    } else {
+        // mFlushOutBuffer always has the right size.
+        pBuf = mFlushOutBuffer;
+    }
+
     ps_dec_ip->s_out_buffer.pu1_bufs[0] = pBuf;
     ps_dec_ip->s_out_buffer.pu1_bufs[1] = pBuf + sizeY;
     ps_dec_ip->s_out_buffer.pu1_bufs[2] = pBuf + sizeY + sizeUV;
     ps_dec_ip->s_out_buffer.u4_num_bufs = 3;
-    return;
+    return true;
 }
 void SoftHEVC::onPortFlushCompleted(OMX_U32 portIndex) {
     /* Once the output buffers are flushed, ignore any buffers that are held in decoder */
@@ -399,7 +438,7 @@ void SoftHEVC::onPortFlushCompleted(OMX_U32 portIndex) {
         uint32_t bufferSize = displayStride * displayHeight * 3 / 2;
         mFlushOutBuffer = (uint8_t *)memalign(128, bufferSize);
         if (NULL == mFlushOutBuffer) {
-            ALOGE("Could not allocate flushOutputBuffer of size %zu", bufferSize);
+            ALOGE("Could not allocate flushOutputBuffer of size %u", bufferSize);
             return;
         }
 
@@ -439,6 +478,9 @@ void SoftHEVC::onQueueFilled(OMX_U32 portIndex) {
 
     if (NULL == mCodecCtx) {
         if (OK != initDecoder()) {
+            ALOGE("Failed to initialize decoder");
+            notify(OMX_EventError, OMX_ErrorUnsupportedSetting, 0, NULL);
+            mSignalledError = true;
             return;
         }
     }
@@ -450,16 +492,6 @@ void SoftHEVC::onQueueFilled(OMX_U32 portIndex) {
 
     List<BufferInfo *> &inQueue = getPortQueue(kInputPortIndex);
     List<BufferInfo *> &outQueue = getPortQueue(kOutputPortIndex);
-
-    /* If input EOS is seen and decoder is not in flush mode,
-     * set the decoder in flush mode.
-     * There can be a case where EOS is sent along with last picture data
-     * In that case, only after decoding that input data, decoder has to be
-     * put in flush. This case is handled here  */
-
-    if (mReceivedEOS && !mIsInFlush) {
-        setFlushMode();
-    }
 
     while (!outQueue.empty()) {
         BufferInfo *inInfo;
@@ -520,7 +552,12 @@ void SoftHEVC::onQueueFilled(OMX_U32 portIndex) {
             WORD32 timeDelay, timeTaken;
             size_t sizeY, sizeUV;
 
-            setDecodeArgs(&s_dec_ip, &s_dec_op, inHeader, outHeader, timeStampIx);
+            if (!setDecodeArgs(&s_dec_ip, &s_dec_op, inHeader, outHeader, timeStampIx)) {
+                ALOGE("Decoder arg setup failed");
+                notify(OMX_EventError, OMX_ErrorUndefined, 0, NULL);
+                mSignalledError = true;
+                return;
+            }
 
             GETTIME(&mTimeStart, NULL);
             /* Compute time elapsed between end of previous decode()
@@ -530,7 +567,28 @@ void SoftHEVC::onQueueFilled(OMX_U32 portIndex) {
             IV_API_CALL_STATUS_T status;
             status = ivdec_api_function(mCodecCtx, (void *)&s_dec_ip, (void *)&s_dec_op);
 
+            bool unsupportedResolution =
+                (IVD_STREAM_WIDTH_HEIGHT_NOT_SUPPORTED == (s_dec_op.u4_error_code & 0xFF));
+
+            /* Check for unsupported dimensions */
+            if (unsupportedResolution) {
+                ALOGE("Unsupported resolution : %dx%d", mWidth, mHeight);
+                notify(OMX_EventError, OMX_ErrorUnsupportedSetting, 0, NULL);
+                mSignalledError = true;
+                return;
+            }
+
+            bool allocationFailed = (IVD_MEM_ALLOC_FAILED == (s_dec_op.u4_error_code & 0xFF));
+            if (allocationFailed) {
+                ALOGE("Allocation failure in decoder");
+                notify(OMX_EventError, OMX_ErrorUnsupportedSetting, 0, NULL);
+                mSignalledError = true;
+                return;
+            }
+
             bool resChanged = (IVD_RES_CHANGED == (s_dec_op.u4_error_code & 0xFF));
+
+            getVUIParams();
 
             GETTIME(&mTimeEnd, NULL);
             /* Compute time taken for decode() */
@@ -554,6 +612,8 @@ void SoftHEVC::onQueueFilled(OMX_U32 portIndex) {
                 mChangingResolution = false;
                 resetDecoder();
                 resetPlugin();
+                mStride = outputBufferWidth();
+                setParams(mStride);
                 continue;
             }
 
@@ -565,6 +625,8 @@ void SoftHEVC::onQueueFilled(OMX_U32 portIndex) {
                 continue;
             }
 
+            // Combine the resolution change and coloraspects change in one PortSettingChange event
+            // if necessary.
             if ((0 < s_dec_op.u4_pic_wd) && (0 < s_dec_op.u4_pic_ht)) {
                 uint32_t width = s_dec_op.u4_pic_wd;
                 uint32_t height = s_dec_op.u4_pic_ht;
@@ -573,8 +635,14 @@ void SoftHEVC::onQueueFilled(OMX_U32 portIndex) {
 
                 if (portWillReset) {
                     resetDecoder();
+                    resetPlugin();
                     return;
                 }
+            } else if (mUpdateColorAspects) {
+                notify(OMX_EventPortSettingsChanged, kOutputPortIndex,
+                    kDescribeColorAspectsIndex, NULL);
+                mUpdateColorAspects = false;
+                return;
             }
 
             if (s_dec_op.u4_output_present) {
@@ -588,7 +656,7 @@ void SoftHEVC::onQueueFilled(OMX_U32 portIndex) {
                 outInfo = NULL;
                 notifyFillBufferDone(outHeader);
                 outHeader = NULL;
-            } else {
+            } else if (mIsInFlush) {
                 /* If in flush mode and no output is returned by the codec,
                  * then come out of flush mode */
                 mIsInFlush = false;
@@ -609,6 +677,16 @@ void SoftHEVC::onQueueFilled(OMX_U32 portIndex) {
             }
         }
 
+        /* If input EOS is seen and decoder is not in flush mode,
+         * set the decoder in flush mode.
+         * There can be a case where EOS is sent along with last picture data
+         * In that case, only after decoding that input data, decoder has to be
+         * put in flush. This case is handled here  */
+
+        if (mReceivedEOS && !mIsInFlush) {
+            setFlushMode();
+        }
+
         // TODO: Handle more than one picture data
         if (inHeader != NULL) {
             inInfo->mOwnedByUs = false;
@@ -618,6 +696,10 @@ void SoftHEVC::onQueueFilled(OMX_U32 portIndex) {
             inHeader = NULL;
         }
     }
+}
+
+int SoftHEVC::getColorAspectPreference() {
+    return kPreferBitstream;
 }
 
 }  // namespace android

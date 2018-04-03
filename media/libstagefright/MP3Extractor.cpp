@@ -252,6 +252,7 @@ MP3Extractor::MP3Extractor(
       mDataSource(source),
       mFirstFramePos(-1),
       mFixedHeader(0) {
+
     off64_t pos = 0;
     off64_t post_id3_pos;
     uint32_t header;
@@ -350,7 +351,13 @@ MP3Extractor::MP3Extractor(
     if (mSeeker == NULL || !mSeeker->getDuration(&durationUs)) {
         off64_t fileSize;
         if (mDataSource->getSize(&fileSize) == OK) {
-            durationUs = 8000LL * (fileSize - mFirstFramePos) / bitrate;
+            off64_t dataLength = fileSize - mFirstFramePos;
+            if (dataLength > INT64_MAX / 8000LL) {
+                // duration would overflow
+                durationUs = INT64_MAX;
+            } else {
+                durationUs = 8000LL * dataLength / bitrate;
+            }
         } else {
             durationUs = -1;
         }
@@ -400,7 +407,7 @@ size_t MP3Extractor::countTracks() {
     return mInitCheck != OK ? 0 : 1;
 }
 
-sp<MediaSource> MP3Extractor::getTrack(size_t index) {
+sp<IMediaSource> MP3Extractor::getTrack(size_t index) {
     if (mInitCheck != OK || index != 0) {
         return NULL;
     }
@@ -531,7 +538,7 @@ status_t MP3Source::read(
             buffer->release();
             buffer = NULL;
 
-            return ERROR_END_OF_STREAM;
+            return (n < 0 ? n : ERROR_END_OF_STREAM);
         }
 
         uint32_t header = U32_AT((const uint8_t *)buffer->data());
@@ -575,7 +582,7 @@ status_t MP3Source::read(
         buffer->release();
         buffer = NULL;
 
-        return ERROR_END_OF_STREAM;
+        return (n < 0 ? n : ERROR_END_OF_STREAM);
     }
 
     buffer->set_range(0, frame_size);

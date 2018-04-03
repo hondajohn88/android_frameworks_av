@@ -42,7 +42,7 @@ class Camera3DummyStream :
      * Set up a dummy stream; doesn't actually connect to anything, and uses
      * a default dummy format and size.
      */
-    Camera3DummyStream(int id);
+    explicit Camera3DummyStream(int id);
 
     virtual ~Camera3DummyStream();
 
@@ -54,10 +54,28 @@ class Camera3DummyStream :
 
     status_t         setTransform(int transform);
 
+    virtual status_t detachBuffer(sp<GraphicBuffer>* buffer, int* fenceFd);
+
+    /**
+     * Drop buffers for stream of streamId if dropping is true. If dropping is false, do not
+     * drop buffers for stream of streamId.
+     */
+    virtual status_t dropBuffers(bool /*dropping*/) override;
+
     /**
      * Return if this output stream is for video encoding.
      */
     bool isVideoStream() const;
+
+    /**
+     * Return if the consumer configuration of this stream is deferred.
+     */
+    virtual bool isConsumerConfigurationDeferred(size_t surface_id) const;
+
+    /**
+     * Set the consumer surfaces to the output stream.
+     */
+    virtual status_t setConsumers(const std::vector<sp<Surface>>& consumers);
 
   protected:
 
@@ -82,19 +100,20 @@ class Camera3DummyStream :
     static const int DUMMY_FORMAT = HAL_PIXEL_FORMAT_IMPLEMENTATION_DEFINED;
     static const android_dataspace DUMMY_DATASPACE = HAL_DATASPACE_UNKNOWN;
     static const camera3_stream_rotation_t DUMMY_ROTATION = CAMERA3_STREAM_ROTATION_0;
-    static const uint32_t DUMMY_USAGE = GRALLOC_USAGE_HW_COMPOSER;
+    static const uint64_t DUMMY_USAGE = GRALLOC_USAGE_HW_COMPOSER;
 
     /**
      * Internal Camera3Stream interface
      */
-    virtual status_t getBufferLocked(camera3_stream_buffer *buffer);
+    virtual status_t getBufferLocked(camera3_stream_buffer *buffer,
+            const std::vector<size_t>& surface_ids = std::vector<size_t>());
     virtual status_t returnBufferLocked(
             const camera3_stream_buffer &buffer,
             nsecs_t timestamp);
 
     virtual status_t configureQueueLocked();
 
-    virtual status_t getEndpointUsage(uint32_t *usage) const;
+    virtual status_t getEndpointUsage(uint64_t *usage) const;
 
 }; // class Camera3DummyStream
 

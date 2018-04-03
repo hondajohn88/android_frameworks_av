@@ -34,13 +34,10 @@
 #include "ServiceUtilities.h"
 #include <hardware_legacy/power.h>
 #include <media/AudioEffect.h>
-#include <media/EffectsFactoryApi.h>
 #include <media/AudioParameter.h>
 
-#include <hardware/hardware.h>
 #include <system/audio.h>
 #include <system/audio_policy.h>
-#include <hardware/audio_policy.h>
 
 namespace android {
 
@@ -52,9 +49,6 @@ static const int kDumpLockSleepUs = 20000;
 
 static const nsecs_t kAudioCommandTimeoutNs = seconds(3); // 3 seconds
 
-namespace {
-    extern struct audio_policy_service_ops aps_ops;
-};
 
 // ----------------------------------------------------------------------------
 
@@ -66,11 +60,6 @@ AudioPolicyService::AudioPolicyService()
 
 void AudioPolicyService::onFirstRef()
 {
-    char value[PROPERTY_VALUE_MAX];
-    const struct hw_module_t *module;
-    int forced_val;
-    int rc;
-
     {
         Mutex::Autolock _l(mLock);
 
@@ -81,42 +70,11 @@ void AudioPolicyService::onFirstRef()
         // start output activity command thread
         mOutputCommandThread = new AudioCommandThread(String8("ApmOutput"), this);
 
-#ifdef USE_LEGACY_AUDIO_POLICY
-        ALOGI("AudioPolicyService CSTOR in legacy mode");
-
-        /* instantiate the audio policy manager */
-        rc = hw_get_module(AUDIO_POLICY_HARDWARE_MODULE_ID, &module);
-        if (rc) {
-            return;
-        }
-        rc = audio_policy_dev_open(module, &mpAudioPolicyDev);
-        ALOGE_IF(rc, "couldn't open audio policy device (%s)", strerror(-rc));
-        if (rc) {
-            return;
-        }
-
-        rc = mpAudioPolicyDev->create_audio_policy(mpAudioPolicyDev, &aps_ops, this,
-                                                   &mpAudioPolicy);
-        ALOGE_IF(rc, "couldn't create audio policy (%s)", strerror(-rc));
-        if (rc) {
-            return;
-        }
-
-        rc = mpAudioPolicy->init_check(mpAudioPolicy);
-        ALOGE_IF(rc, "couldn't init_check the audio policy (%s)", strerror(-rc));
-        if (rc) {
-            return;
-        }
-        ALOGI("Loaded audio policy from %s (%s)", module->name, module->id);
-#else
-        ALOGI("AudioPolicyService CSTOR in new mode");
-
         mAudioPolicyClient = new AudioPolicyClient(this);
         mAudioPolicyManager = createAudioPolicyManager(mAudioPolicyClient);
-#endif
     }
     // load audio processing modules
-    sp<AudioPolicyEffects>audioPolicyEffects = new AudioPolicyEffects();
+    sp<AudioPolicyEffects>audioPolicyEffects = new AudioPolicyEffects(this);
     {
         Mutex::Autolock _l(mLock);
         mAudioPolicyEffects = audioPolicyEffects;
@@ -129,17 +87,8 @@ AudioPolicyService::~AudioPolicyService()
     mAudioCommandThread->exit();
     mOutputCommandThread->exit();
 
-#ifdef USE_LEGACY_AUDIO_POLICY
-    if (mpAudioPolicy != NULL && mpAudioPolicyDev != NULL) {
-        mpAudioPolicyDev->destroy_audio_policy(mpAudioPolicyDev, mpAudioPolicy);
-    }
-    if (mpAudioPolicyDev != NULL) {
-        audio_policy_dev_close(mpAudioPolicyDev);
-    }
-#else
     destroyAudioPolicyManager(mAudioPolicyManager);
     delete mAudioPolicyClient;
-#endif
 
     mNotificationClients.clear();
     mAudioPolicyEffects.clear();
@@ -149,7 +98,10 @@ AudioPolicyService::~AudioPolicyService()
 // connects to AudioPolicyService.
 void AudioPolicyService::registerClient(const sp<IAudioPolicyServiceClient>& client)
 {
-
+    if (client == 0) {
+        ALOGW("%s got NULL client", __FUNCTION__);
+        return;
+    }
     Mutex::Autolock _l(mNotificationClientsLock);
 
     uid_t uid = IPCThreadState::self()->getCallingUid();
@@ -184,14 +136,12 @@ void AudioPolicyService::removeNotificationClient(uid_t uid)
         Mutex::Autolock _l(mNotificationClientsLock);
         mNotificationClients.removeItem(uid);
     }
-#ifndef USE_LEGACY_AUDIO_POLICY
     {
         Mutex::Autolock _l(mLock);
         if (mAudioPolicyManager) {
             mAudioPolicyManager->releaseResourcesForUid(uid);
         }
     }
-#endif
 }
 
 void AudioPolicyService::onAudioPortListUpdate()
@@ -212,6 +162,48 @@ void AudioPolicyService::onAudioPatchListUpdate()
     mOutputCommandThread->updateAudioPatchListCommand();
 }
 
+void AudioPolicyService::doOnAudioPatchListUpdate()
+{
+    Mutex::Autolock _l(mNotificationClientsLock);
+    for (size_t i = 0; i < mNotificationClients.size(); i++) {
+        mNotificationClients.valueAt(i)->onAudioPatchListUpdate();
+    }
+}
+
+void AudioPolicyService::onDynamicPolicyMixStateUpdate(const String8& regId, int32_t state)
+{
+    ALOGV("AudioPolicyService::onDynamicPolicyMixStateUpdate(%s, %d)",
+            regId.string(), state);
+    mOutputCommandThread->dynamicPolicyMixStateUpdateCommand(regId, state);
+}
+
+void AudioPolicyService::doOnDynamicPolicyMixStateUpdate(const String8& regId, int32_t state)
+{
+    Mutex::Autolock _l(mNotificationClientsLock);
+    for (size_t i = 0; i < mNotificationClients.size(); i++) {
+        mNotificationClients.valueAt(i)->onDynamicPolicyMixStateUpdate(regId, state);
+    }
+}
+
+void AudioPolicyService::onRecordingConfigurationUpdate(int event,
+        const record_client_info_t *clientInfo, const audio_config_base_t *clientConfig,
+        const audio_config_base_t *deviceConfig, audio_patch_handle_t patchHandle)
+{
+    mOutputCommandThread->recordingConfigurationUpdateCommand(event, clientInfo,
+            clientConfig, deviceConfig, patchHandle);
+}
+
+void AudioPolicyService::doOnRecordingConfigurationUpdate(int event,
+        const record_client_info_t *clientInfo, const audio_config_base_t *clientConfig,
+        const audio_config_base_t *deviceConfig, audio_patch_handle_t patchHandle)
+{
+    Mutex::Autolock _l(mNotificationClientsLock);
+    for (size_t i = 0; i < mNotificationClients.size(); i++) {
+        mNotificationClients.valueAt(i)->onRecordingConfigurationUpdate(event, clientInfo,
+                clientConfig, deviceConfig, patchHandle);
+    }
+}
+
 status_t AudioPolicyService::clientCreateAudioPatch(const struct audio_patch *patch,
                                                 audio_patch_handle_t *handle,
                                                 int delayMs)
@@ -225,33 +217,25 @@ status_t AudioPolicyService::clientReleaseAudioPatch(audio_patch_handle_t handle
     return mAudioCommandThread->releaseAudioPatchCommand(handle, delayMs);
 }
 
-void AudioPolicyService::doOnAudioPatchListUpdate()
-{
-    Mutex::Autolock _l(mNotificationClientsLock);
-    for (size_t i = 0; i < mNotificationClients.size(); i++) {
-        mNotificationClients.valueAt(i)->onAudioPatchListUpdate();
-    }
-}
-
-void AudioPolicyService::onDynamicPolicyMixStateUpdate(String8 regId, int32_t state)
-{
-    ALOGV("AudioPolicyService::onDynamicPolicyMixStateUpdate(%s, %d)",
-            regId.string(), state);
-    mOutputCommandThread->dynamicPolicyMixStateUpdateCommand(regId, state);
-}
-
-void AudioPolicyService::doOnDynamicPolicyMixStateUpdate(String8 regId, int32_t state)
-{
-    Mutex::Autolock _l(mNotificationClientsLock);
-    for (size_t i = 0; i < mNotificationClients.size(); i++) {
-        mNotificationClients.valueAt(i)->onDynamicPolicyMixStateUpdate(regId, state);
-    }
-}
-
 status_t AudioPolicyService::clientSetAudioPortConfig(const struct audio_port_config *config,
                                                       int delayMs)
 {
     return mAudioCommandThread->setAudioPortConfigCommand(config, delayMs);
+}
+
+void AudioPolicyService::onOutputSessionEffectsUpdate(sp<AudioSessionInfo>& info, bool added)
+{
+    ALOGV("AudioPolicyService::onOutputSessionEffectsUpdate(%d, %d, %d)",
+            info->mStream, info->mSessionId, added);
+    mOutputCommandThread->effectSessionUpdateCommand(info, added);
+}
+
+void AudioPolicyService::doOnOutputSessionEffectsUpdate(sp<AudioSessionInfo>& info, bool added)
+{
+    Mutex::Autolock _l(mNotificationClientsLock);
+    for (size_t i = 0; i < mNotificationClients.size(); i++) {
+        mNotificationClients.valueAt(i)->onOutputSessionEffectsUpdate(info, added);
+    }
 }
 
 AudioPolicyService::NotificationClient::NotificationClient(const sp<AudioPolicyService>& service,
@@ -289,11 +273,30 @@ void AudioPolicyService::NotificationClient::onAudioPatchListUpdate()
     }
 }
 
-void AudioPolicyService::NotificationClient::onDynamicPolicyMixStateUpdate(
-        String8 regId, int32_t state)
+void AudioPolicyService::NotificationClient::onOutputSessionEffectsUpdate(
+        sp<AudioSessionInfo>& info, bool added)
 {
     if (mAudioPolicyServiceClient != 0) {
-            mAudioPolicyServiceClient->onDynamicPolicyMixStateUpdate(regId, state);
+        mAudioPolicyServiceClient->onOutputSessionEffectsUpdate(info, added);
+    }
+}
+
+void AudioPolicyService::NotificationClient::onDynamicPolicyMixStateUpdate(
+        const String8& regId, int32_t state)
+{
+    if (mAudioPolicyServiceClient != 0) {
+        mAudioPolicyServiceClient->onDynamicPolicyMixStateUpdate(regId, state);
+    }
+}
+
+void AudioPolicyService::NotificationClient::onRecordingConfigurationUpdate(
+        int event, const record_client_info_t *clientInfo,
+        const audio_config_base_t *clientConfig, const audio_config_base_t *deviceConfig,
+        audio_patch_handle_t patchHandle)
+{
+    if (mAudioPolicyServiceClient != 0) {
+        mAudioPolicyServiceClient->onRecordingConfigurationUpdate(event, clientInfo,
+                clientConfig, deviceConfig, patchHandle);
     }
 }
 
@@ -327,11 +330,7 @@ status_t AudioPolicyService::dumpInternals(int fd)
     char buffer[SIZE];
     String8 result;
 
-#ifdef USE_LEGACY_AUDIO_POLICY
-    snprintf(buffer, SIZE, "PolicyManager Interface: %p\n", mpAudioPolicy);
-#else
     snprintf(buffer, SIZE, "AudioPolicyManager: %p\n", mAudioPolicyManager);
-#endif
     result.append(buffer);
     snprintf(buffer, SIZE, "Command Thread: %p\n", mAudioCommandThread.get());
     result.append(buffer);
@@ -361,15 +360,9 @@ status_t AudioPolicyService::dump(int fd, const Vector<String16>& args __unused)
             mTonePlaybackThread->dump(fd);
         }
 
-#ifdef USE_LEGACY_AUDIO_POLICY
-        if (mpAudioPolicy) {
-            mpAudioPolicy->dump(mpAudioPolicy, fd);
-        }
-#else
         if (mAudioPolicyManager) {
             mAudioPolicyManager->dump(fd);
         }
-#endif
 
         if (locked) mLock.unlock();
     }
@@ -423,7 +416,7 @@ void AudioPolicyService::AudioCommandThread::onFirstRef()
 
 bool AudioPolicyService::AudioCommandThread::threadLoop()
 {
-    nsecs_t waitTime = INT64_MAX;
+    nsecs_t waitTime = -1;
 
     mLock.lock();
     while (!exitPending())
@@ -555,7 +548,6 @@ bool AudioPolicyService::AudioCommandThread::threadLoop()
                 case DYN_POLICY_MIX_STATE_UPDATE: {
                     DynPolicyMixStateUpdateData *data =
                             (DynPolicyMixStateUpdateData *)command->mParam.get();
-                    //###ALOGV("AudioCommandThread() processing dyn policy mix state update");
                     ALOGV("AudioCommandThread() processing dyn policy mix state update %s %d",
                             data->mRegId.string(), data->mState);
                     svc = mService.promote();
@@ -566,6 +558,35 @@ bool AudioPolicyService::AudioCommandThread::threadLoop()
                     svc->doOnDynamicPolicyMixStateUpdate(data->mRegId, data->mState);
                     mLock.lock();
                     } break;
+                case RECORDING_CONFIGURATION_UPDATE: {
+                    RecordingConfigurationUpdateData *data =
+                            (RecordingConfigurationUpdateData *)command->mParam.get();
+                    ALOGV("AudioCommandThread() processing recording configuration update");
+                    svc = mService.promote();
+                    if (svc == 0) {
+                        break;
+                    }
+                    mLock.unlock();
+                    svc->doOnRecordingConfigurationUpdate(data->mEvent, &data->mClientInfo,
+                            &data->mClientConfig, &data->mDeviceConfig,
+                            data->mPatchHandle);
+                    mLock.lock();
+                    } break;
+                case EFFECT_SESSION_UPDATE: {
+                    EffectSessionUpdateData *data =
+                            (EffectSessionUpdateData *)command->mParam.get();
+                    ALOGV("AudioCommandThread() processing effect session update %d %d %d",
+                            data->mAudioSessionInfo->mStream, data->mAudioSessionInfo->mSessionId,
+                            data->mAdded);
+                    svc = mService.promote();
+                    if (svc == 0) {
+                        break;
+                    }
+                    mLock.unlock();
+                    svc->doOnOutputSessionEffectsUpdate(data->mAudioSessionInfo, data->mAdded);
+                    mLock.lock();
+                    } break;
+
                 default:
                     ALOGW("AudioCommandThread() unknown command %d", command->mCommand);
                 }
@@ -576,7 +597,7 @@ bool AudioPolicyService::AudioCommandThread::threadLoop()
                         command->mCond.signal();
                     }
                 }
-                waitTime = INT64_MAX;
+                waitTime = -1;
                 // release mLock before releasing strong reference on the service as
                 // AudioPolicyService destructor calls AudioCommandThread::exit() which
                 // acquires mLock.
@@ -598,7 +619,11 @@ bool AudioPolicyService::AudioCommandThread::threadLoop()
         // has a finite delay. So unless we are exiting it is safe to wait.
         if (!exitPending()) {
             ALOGV("AudioCommandThread() going to sleep");
-            mWaitWorkCV.waitRelative(mLock, waitTime);
+            if (waitTime == -1) {
+                mWaitWorkCV.wait(mLock);
+            } else {
+                mWaitWorkCV.waitRelative(mLock, waitTime);
+            }
         }
     }
     // release delayed commands wake lock before quitting
@@ -809,7 +834,7 @@ status_t AudioPolicyService::AudioCommandThread::setAudioPortConfigCommand(
 }
 
 void AudioPolicyService::AudioCommandThread::dynamicPolicyMixStateUpdateCommand(
-        String8 regId, int32_t state)
+        const String8& regId, int32_t state)
 {
     sp<AudioCommand> command = new AudioCommand();
     command->mCommand = DYN_POLICY_MIX_STATE_UPDATE;
@@ -819,6 +844,39 @@ void AudioPolicyService::AudioCommandThread::dynamicPolicyMixStateUpdateCommand(
     command->mParam = data;
     ALOGV("AudioCommandThread() sending dynamic policy mix (id=%s) state update to %d",
             regId.string(), state);
+    sendCommand(command);
+}
+
+void AudioPolicyService::AudioCommandThread::recordingConfigurationUpdateCommand(
+        int event, const record_client_info_t *clientInfo,
+        const audio_config_base_t *clientConfig, const audio_config_base_t *deviceConfig,
+        audio_patch_handle_t patchHandle)
+{
+    sp<AudioCommand>command = new AudioCommand();
+    command->mCommand = RECORDING_CONFIGURATION_UPDATE;
+    RecordingConfigurationUpdateData *data = new RecordingConfigurationUpdateData();
+    data->mEvent = event;
+    data->mClientInfo = *clientInfo;
+    data->mClientConfig = *clientConfig;
+    data->mDeviceConfig = *deviceConfig;
+    data->mPatchHandle = patchHandle;
+    command->mParam = data;
+    ALOGV("AudioCommandThread() adding recording configuration update event %d, source %d uid %u",
+            event, clientInfo->source, clientInfo->uid);
+    sendCommand(command);
+}
+
+void AudioPolicyService::AudioCommandThread::effectSessionUpdateCommand(
+        sp<AudioSessionInfo>& streamInfo, bool added)
+{
+    sp<AudioCommand> command = new AudioCommand();
+    command->mCommand = EFFECT_SESSION_UPDATE;
+    EffectSessionUpdateData *data = new EffectSessionUpdateData();
+    data->mAudioSessionInfo = streamInfo;
+    data->mAdded = added;
+    command->mParam = data;
+    ALOGV("AudioCommandThread() sending effect session update (id=%d) for stream %d (added=%d)",
+            streamInfo->mStream, streamInfo->mSessionId, added);
     sendCommand(command);
 }
 
@@ -919,6 +977,18 @@ void AudioPolicyService::AudioCommandThread::insertCommand_l(sp<AudioCommand>& c
             delayMs = 1;
         } break;
 
+        case SET_VOICE_VOLUME: {
+            VoiceVolumeData *data = (VoiceVolumeData *)command->mParam.get();
+            VoiceVolumeData *data2 = (VoiceVolumeData *)command2->mParam.get();
+            ALOGV("Filtering out voice volume command value %f replaced by %f",
+                  data2->mVolume, data->mVolume);
+            removedCommands.add(command2);
+            command->mTime = command2->mTime;
+            // force delayMs to non 0 so that code below does not request to wait for
+            // command status as the command is now delayed
+            delayMs = 1;
+        } break;
+
         case CREATE_AUDIO_PATCH:
         case RELEASE_AUDIO_PATCH: {
             audio_patch_handle_t handle;
@@ -965,6 +1035,10 @@ void AudioPolicyService::AudioCommandThread::insertCommand_l(sp<AudioCommand>& c
         } break;
 
         case DYN_POLICY_MIX_STATE_UPDATE: {
+
+        } break;
+
+        case RECORDING_CONFIGURATION_UPDATE: {
 
         } break;
 
@@ -1108,7 +1182,7 @@ audio_io_handle_t aps_open_input_on_module(void *service __unused,
                                                   audio_channel_mask_t *pChannelMask);
 int aps_close_input(void *service __unused, audio_io_handle_t input);
 int aps_invalidate_stream(void *service __unused, audio_stream_type_t stream);
-int aps_move_effects(void *service __unused, int session,
+int aps_move_effects(void *service __unused, audio_session_t session,
                                 audio_io_handle_t src_output,
                                 audio_io_handle_t dst_output);
 char * aps_get_parameters(void *service __unused, audio_io_handle_t io_handle,
@@ -1123,28 +1197,5 @@ int aps_start_tone(void *service, audio_policy_tone_t tone,
 int aps_stop_tone(void *service);
 int aps_set_voice_volume(void *service, float volume, int delay_ms);
 };
-
-namespace {
-    struct audio_policy_service_ops aps_ops = {
-        .open_output           = aps_open_output,
-        .open_duplicate_output = aps_open_dup_output,
-        .close_output          = aps_close_output,
-        .suspend_output        = aps_suspend_output,
-        .restore_output        = aps_restore_output,
-        .open_input            = aps_open_input,
-        .close_input           = aps_close_input,
-        .set_stream_volume     = aps_set_stream_volume,
-        .invalidate_stream     = aps_invalidate_stream,
-        .set_parameters        = aps_set_parameters,
-        .get_parameters        = aps_get_parameters,
-        .start_tone            = aps_start_tone,
-        .stop_tone             = aps_stop_tone,
-        .set_voice_volume      = aps_set_voice_volume,
-        .move_effects          = aps_move_effects,
-        .load_hw_module        = aps_load_hw_module,
-        .open_output_on_module = aps_open_output_on_module,
-        .open_input_on_module  = aps_open_input_on_module,
-    };
-}; // namespace <unnamed>
 
 }; // namespace android

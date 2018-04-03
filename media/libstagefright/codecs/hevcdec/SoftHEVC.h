@@ -18,7 +18,7 @@
 
 #define SOFT_HEVC_H_
 
-#include "SoftVideoDecoderOMXComponent.h"
+#include <media/stagefright/omx/SoftVideoDecoderOMXComponent.h>
 #include <sys/time.h>
 
 namespace android {
@@ -46,8 +46,8 @@ namespace android {
 
 /** Compute difference between start and end */
 #define TIME_DIFF(start, end, diff) \
-    diff = ((end.tv_sec - start.tv_sec) * 1000000) + \
-            (end.tv_usec - start.tv_usec);
+    diff = (((end).tv_sec - (start).tv_sec) * 1000000) + \
+            ((end).tv_usec - (start).tv_usec);
 
 struct SoftHEVC: public SoftVideoDecoderOMXComponent {
     SoftHEVC(const char *name, const OMX_CALLBACKTYPE *callbacks,
@@ -61,6 +61,7 @@ protected:
     virtual void onQueueFilled(OMX_U32 portIndex);
     virtual void onPortFlushCompleted(OMX_U32 portIndex);
     virtual void onReset();
+    virtual int getColorAspectPreference();
 private:
     // Number of input and output buffers
     enum {
@@ -106,11 +107,13 @@ private:
     status_t resetDecoder();
     status_t resetPlugin();
 
-    void setDecodeArgs(ivd_video_decode_ip_t *ps_dec_ip,
+    bool setDecodeArgs(ivd_video_decode_ip_t *ps_dec_ip,
         ivd_video_decode_op_t *ps_dec_op,
         OMX_BUFFERHEADERTYPE *inHeader,
         OMX_BUFFERHEADERTYPE *outHeader,
         size_t timeStampIx);
+
+    bool getVUIParams();
 
     DISALLOW_EVIL_CONSTRUCTORS (SoftHEVC);
 };
