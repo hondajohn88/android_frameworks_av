@@ -533,6 +533,11 @@ void CameraClient::releaseRecordingFrameHandle(native_handle_t *handle) {
     metadata->pHandle = handle;
 
     mHardware->releaseRecordingFrame(dataPtr);
+
+#ifdef CAMERASERVICE_CLOSES_NATIVE_HANDLES
+    native_handle_close(handle);
+    native_handle_delete(handle);
+#endif
 }
 
 void CameraClient::releaseRecordingFrameHandleBatch(const std::vector<native_handle_t*>& handles) {
@@ -780,6 +785,9 @@ void CameraClient::disableMsgType(int32_t msgType) {
 
 #define CHECK_MESSAGE_INTERVAL 10 // 10ms
 bool CameraClient::lockIfMessageWanted(int32_t msgType) {
+#ifdef MTK_HARDWARE
+    return true;
+#endif
     int sleepCount = 0;
     while (mMsgEnabled & msgType) {
         if (mLock.tryLock() == NO_ERROR) {
