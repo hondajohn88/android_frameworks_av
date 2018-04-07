@@ -74,10 +74,10 @@ LOCAL_SHARED_LIBRARIES:= \
     libhidltransport \
     libjpeg \
     libmemunreachable \
+    libnativewindow \
     android.hardware.camera.common@1.0 \
     android.hardware.camera.provider@2.4 \
     android.hardware.camera.device@1.0 \
-    vendor.qti.hardware.camera.device@1.0 \
     android.hardware.camera.device@3.2 \
     android.hardware.camera.device@3.3
 
@@ -94,6 +94,10 @@ LOCAL_CFLAGS += -Wall -Wextra -Werror
 
 # Workaround for invalid unused-lambda-capture warning http://b/38349491
 LOCAL_CLANG_CFLAGS += -Wno-error=unused-lambda-capture
+
+ifeq ($(TARGET_CAMERASERVICE_CLOSES_NATIVE_HANDLES),true)
+    LOCAL_CFLAGS += -DCAMERASERVICE_CLOSES_NATIVE_HANDLES
+endif
 
 LOCAL_MODULE:= libcameraservice
 
