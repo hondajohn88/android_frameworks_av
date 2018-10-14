@@ -23,7 +23,7 @@
 #include "MtpResponsePacket.h"
 #include "MtpTypes.h"
 
-#include <utils/threads.h>
+#include <mutex>
 
 struct usb_device;
 struct usb_request;
@@ -67,9 +67,9 @@ private:
     MtpObjectHandle         mLastSendObjectInfoObjectHandle;
 
     // to ensure only one MTP transaction at a time
-    Mutex                   mMutex;
-    Mutex                   mEventMutex;
-    Mutex                   mEventMutexForInterrupt;
+    std::mutex              mMutex;
+    std::mutex              mEventMutex;
+    std::mutex              mEventMutexForInterrupt;
 
     // Remember the device's packet division mode.
     UrbPacketDivisionMode   mPacketDivisionMode;
@@ -104,7 +104,7 @@ public:
     MtpObjectInfo*          getObjectInfo(MtpObjectHandle handle);
     void*                   getThumbnail(MtpObjectHandle handle, int& outLength);
     MtpObjectHandle         sendObjectInfo(MtpObjectInfo* info);
-    bool                    sendObject(MtpObjectHandle handle, int size, int srcFD);
+    bool                    sendObject(MtpObjectHandle handle, uint32_t size, int srcFD);
     bool                    deleteObject(MtpObjectHandle handle);
     MtpObjectHandle         getParent(MtpObjectHandle handle);
     MtpStorageID            getStorageID(MtpObjectHandle handle);

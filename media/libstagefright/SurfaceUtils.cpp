@@ -18,8 +18,8 @@
 #define LOG_TAG "SurfaceUtils"
 #include <utils/Log.h>
 
+#include <media/hardware/VideoAPI.h>
 #include <media/stagefright/SurfaceUtils.h>
-
 #include <gui/Surface.h>
 
 namespace android {
@@ -108,8 +108,9 @@ status_t setNativeWindowSizeFormatAndUsage(
         }
     }
 
-    int finalUsage = usage | consumerUsage;
-    ALOGV("gralloc usage: %#x(producer) + %#x(consumer) = %#x", usage, consumerUsage, finalUsage);
+    uint64_t finalUsage = (usage | consumerUsage) & 0xffffffffLL;
+    ALOGV("gralloc usage: %#x(producer) + %#x(consumer) = %#" PRIx64,
+            usage, consumerUsage, finalUsage);
     err = native_window_set_usage(nativeWindow, finalUsage);
     if (err != NO_ERROR) {
         ALOGE("native_window_set_usage failed: %s (%d)", strerror(-err), -err);
@@ -123,9 +124,43 @@ status_t setNativeWindowSizeFormatAndUsage(
         return err;
     }
 
-    ALOGD("set up nativeWindow %p for %dx%d, color %#x, rotation %d, usage %#x",
+    ALOGD("set up nativeWindow %p for %dx%d, color %#x, rotation %d, usage %#" PRIx64,
             nativeWindow, width, height, format, rotation, finalUsage);
     return NO_ERROR;
+}
+
+void setNativeWindowHdrMetadata(ANativeWindow *nativeWindow, HDRStaticInfo *info) {
+    struct android_smpte2086_metadata smpte2086_meta = {
+            .displayPrimaryRed = {
+                    info->sType1.mR.x * 0.00002f,
+                    info->sType1.mR.y * 0.00002f
+            },
+            .displayPrimaryGreen = {
+                    info->sType1.mG.x * 0.00002f,
+                    info->sType1.mG.y * 0.00002f
+            },
+            .displayPrimaryBlue = {
+                    info->sType1.mB.x * 0.00002f,
+                    info->sType1.mB.y * 0.00002f
+            },
+            .whitePoint = {
+                    info->sType1.mW.x * 0.00002f,
+                    info->sType1.mW.y * 0.00002f
+            },
+            .maxLuminance = (float) info->sType1.mMaxDisplayLuminance,
+            .minLuminance = info->sType1.mMinDisplayLuminance * 0.0001f
+    };
+
+    int err = native_window_set_buffers_smpte2086_metadata(nativeWindow, &smpte2086_meta);
+    ALOGW_IF(err != 0, "failed to set smpte2086 metadata on surface (%d)", err);
+
+    struct android_cta861_3_metadata cta861_meta = {
+            .maxContentLightLevel = (float) info->sType1.mMaxContentLightLevel,
+            .maxFrameAverageLightLevel = (float) info->sType1.mMaxFrameAverageLightLevel
+    };
+
+    err = native_window_set_buffers_cta861_3_metadata(nativeWindow, &cta861_meta);
+    ALOGW_IF(err != 0, "failed to set cta861_3 metadata on surface (%d)", err);
 }
 
 status_t pushBlankBuffersToNativeWindow(ANativeWindow *nativeWindow /* nonnull */) {

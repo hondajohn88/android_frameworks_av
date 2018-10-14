@@ -511,11 +511,12 @@ size_t AudioPolicyEffects::growParamSize(char **param,
         while (pos + size > *totSize) {
             *totSize += ((*totSize + 7) / 8) * 4;
         }
-        *param = (char *)realloc(*param, *totSize);
-        if (*param == NULL) {
+        char *newParam = (char *)realloc(*param, *totSize);
+        if (newParam == NULL) {
             ALOGE("%s realloc error for size %zu", __func__, *totSize);
             return 0;
         }
+        *param = newParam;
     }
     *curSize = pos + size;
     return pos;
@@ -856,4 +857,4 @@ status_t AudioPolicyEffects::loadAudioEffectConfig(const char *path)
 }
 
 
-}; // namespace android
+} // namespace android

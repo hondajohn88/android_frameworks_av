@@ -344,7 +344,7 @@ bool OMXNodeInstance::CallbackDispatcherThread::threadLoop() {
 ////////////////////////////////////////////////////////////////////////////////
 
 OMXNodeInstance::OMXNodeInstance(
-        OmxNodeOwner *owner, const sp<IOMXObserver> &observer, const char *name)
+        Omx *owner, const sp<IOMXObserver> &observer, const char *name)
     : mOwner(owner),
       mHandle(NULL),
       mObserver(observer),
@@ -354,7 +354,7 @@ OMXNodeInstance::OMXNodeInstance(
       mQuirks(0),
       mBufferIDCount(0),
       mRestorePtsFailed(false),
-      mMaxTimestampGapUs(-1ll),
+      mMaxTimestampGapUs(0ll),
       mPrevOriginalTimeUs(-1ll),
       mPrevModifiedTimeUs(-1ll)
 {
@@ -500,6 +500,9 @@ status_t OMXNodeInstance::freeNode() {
 
     Mutex::Autolock _l(mLock);
 
+    if (mActiveBuffers.size() > 0) {
+        freeActiveBuffers();
+    }
     status_t err = mOwner->freeNode(this);
 
     mDispatcher.clear();
@@ -535,6 +538,9 @@ status_t OMXNodeInstance::sendCommand(
     }
 
     Mutex::Autolock autoLock(mLock);
+    if (mHandle == NULL) {
+        return DEAD_OBJECT;
+    }
 
     if (cmd == OMX_CommandStateSet) {
         // There are no configurations past first StateSet command.
@@ -599,6 +605,9 @@ bool OMXNodeInstance::isProhibitedIndex_l(OMX_INDEXTYPE index) {
 status_t OMXNodeInstance::getParameter(
         OMX_INDEXTYPE index, void *params, size_t /* size */) {
     Mutex::Autolock autoLock(mLock);
+    if (mHandle == NULL) {
+        return DEAD_OBJECT;
+    }
 
     if (isProhibitedIndex_l(index)) {
         android_errorWriteLog(0x534e4554, "29422020");
@@ -617,6 +626,10 @@ status_t OMXNodeInstance::getParameter(
 status_t OMXNodeInstance::setParameter(
         OMX_INDEXTYPE index, const void *params, size_t size) {
     Mutex::Autolock autoLock(mLock);
+    if (mHandle == NULL) {
+        return DEAD_OBJECT;
+    }
+
     OMX_INDEXEXTTYPE extIndex = (OMX_INDEXEXTTYPE)index;
     CLOG_CONFIG(setParameter, "%s(%#x), %zu@%p)", asString(extIndex), index, size, params);
 
@@ -638,6 +651,9 @@ status_t OMXNodeInstance::setParameter(
 status_t OMXNodeInstance::getConfig(
         OMX_INDEXTYPE index, void *params, size_t /* size */) {
     Mutex::Autolock autoLock(mLock);
+    if (mHandle == NULL) {
+        return DEAD_OBJECT;
+    }
 
     if (isProhibitedIndex_l(index)) {
         android_errorWriteLog(0x534e4554, "29422020");
@@ -656,6 +672,10 @@ status_t OMXNodeInstance::getConfig(
 status_t OMXNodeInstance::setConfig(
         OMX_INDEXTYPE index, const void *params, size_t size) {
     Mutex::Autolock autoLock(mLock);
+    if (mHandle == NULL) {
+        return DEAD_OBJECT;
+    }
+
     OMX_INDEXEXTTYPE extIndex = (OMX_INDEXEXTTYPE)index;
     CLOG_CONFIG(setConfig, "%s(%#x), %zu@%p)", asString(extIndex), index, size, params);
 
@@ -672,6 +692,9 @@ status_t OMXNodeInstance::setConfig(
 
 status_t OMXNodeInstance::setPortMode(OMX_U32 portIndex, IOMX::PortMode mode) {
     Mutex::Autolock autoLock(mLock);
+    if (mHandle == NULL) {
+        return DEAD_OBJECT;
+    }
 
     if (portIndex >= NELEM(mPortMode)) {
         ALOGE("b/31385713, portIndex(%u)", portIndex);
@@ -686,6 +709,7 @@ status_t OMXNodeInstance::setPortMode(OMX_U32 portIndex, IOMX::PortMode mode) {
 
     CLOG_CONFIG(setPortMode, "%s(%d), port %d", asString(mode), mode, portIndex);
 
+    status_t err = OK;
     switch (mode) {
     case IOMX::kPortModeDynamicANWBuffer:
     {
@@ -694,17 +718,19 @@ status_t OMXNodeInstance::setPortMode(OMX_U32 portIndex, IOMX::PortMode mode) {
                 CLOG_INTERNAL(setPortMode, "Legacy adaptive experiment: "
                         "not setting port mode to %s(%d) on output",
                         asString(mode), mode);
-                return StatusFromOMXError(OMX_ErrorUnsupportedIndex);
+                err = StatusFromOMXError(OMX_ErrorUnsupportedIndex);
+                break;
             }
 
-            status_t err = enableNativeBuffers_l(
+            err = enableNativeBuffers_l(
                     portIndex, OMX_TRUE /*graphic*/, OMX_TRUE);
             if (err != OK) {
-                return err;
+                break;
             }
         }
         (void)enableNativeBuffers_l(portIndex, OMX_FALSE /*graphic*/, OMX_FALSE);
-        return storeMetaDataInBuffers_l(portIndex, OMX_TRUE, NULL);
+        err = storeMetaDataInBuffers_l(portIndex, OMX_TRUE, NULL);
+        break;
     }
 
     case IOMX::kPortModeDynamicNativeHandle:
@@ -712,13 +738,15 @@ status_t OMXNodeInstance::setPortMode(OMX_U32 portIndex, IOMX::PortMode mode) {
         if (portIndex != kPortIndexInput) {
             CLOG_ERROR(setPortMode, BAD_VALUE,
                     "%s(%d) mode is only supported on input port", asString(mode), mode);
-            return BAD_VALUE;
+            err = BAD_VALUE;
+            break;
         }
         (void)enableNativeBuffers_l(portIndex, OMX_TRUE /*graphic*/, OMX_FALSE);
         (void)enableNativeBuffers_l(portIndex, OMX_FALSE /*graphic*/, OMX_FALSE);
 
         MetadataBufferType metaType = kMetadataBufferTypeNativeHandleSource;
-        return storeMetaDataInBuffers_l(portIndex, OMX_TRUE, &metaType);
+        err = storeMetaDataInBuffers_l(portIndex, OMX_TRUE, &metaType);
+        break;
     }
 
     case IOMX::kPortModePresetSecureBuffer:
@@ -726,7 +754,8 @@ status_t OMXNodeInstance::setPortMode(OMX_U32 portIndex, IOMX::PortMode mode) {
         // Allow on both input and output.
         (void)storeMetaDataInBuffers_l(portIndex, OMX_FALSE, NULL);
         (void)enableNativeBuffers_l(portIndex, OMX_TRUE /*graphic*/, OMX_FALSE);
-        return enableNativeBuffers_l(portIndex, OMX_FALSE /*graphic*/, OMX_TRUE);
+        err = enableNativeBuffers_l(portIndex, OMX_FALSE /*graphic*/, OMX_TRUE);
+        break;
     }
 
     case IOMX::kPortModePresetANWBuffer:
@@ -734,7 +763,8 @@ status_t OMXNodeInstance::setPortMode(OMX_U32 portIndex, IOMX::PortMode mode) {
         if (portIndex != kPortIndexOutput) {
             CLOG_ERROR(setPortMode, BAD_VALUE,
                     "%s(%d) mode is only supported on output port", asString(mode), mode);
-            return BAD_VALUE;
+            err = BAD_VALUE;
+            break;
         }
 
         // Check if we're simulating legacy mode with metadata mode,
@@ -743,7 +773,7 @@ status_t OMXNodeInstance::setPortMode(OMX_U32 portIndex, IOMX::PortMode mode) {
             if (storeMetaDataInBuffers_l(portIndex, OMX_TRUE, NULL) == OK) {
                 CLOG_INTERNAL(setPortMode, "Legacy adaptive experiment: "
                         "metdata mode enabled successfully");
-                return OK;
+                break;
             }
 
             CLOG_INTERNAL(setPortMode, "Legacy adaptive experiment: "
@@ -754,15 +784,15 @@ status_t OMXNodeInstance::setPortMode(OMX_U32 portIndex, IOMX::PortMode mode) {
 
         // Disable secure buffer and enable graphic buffer
         (void)enableNativeBuffers_l(portIndex, OMX_FALSE /*graphic*/, OMX_FALSE);
-        status_t err = enableNativeBuffers_l(portIndex, OMX_TRUE /*graphic*/, OMX_TRUE);
+        err = enableNativeBuffers_l(portIndex, OMX_TRUE /*graphic*/, OMX_TRUE);
         if (err != OK) {
-            return err;
+            break;
         }
 
         // Not running experiment, or metadata is not supported.
         // Disable metadata mode and use legacy mode.
         (void)storeMetaDataInBuffers_l(portIndex, OMX_FALSE, NULL);
-        return OK;
+        break;
     }
 
     case IOMX::kPortModePresetByteBuffer:
@@ -771,15 +801,19 @@ status_t OMXNodeInstance::setPortMode(OMX_U32 portIndex, IOMX::PortMode mode) {
         (void)enableNativeBuffers_l(portIndex, OMX_TRUE /*graphic*/, OMX_FALSE);
         (void)enableNativeBuffers_l(portIndex, OMX_FALSE /*graphic*/, OMX_FALSE);
         (void)storeMetaDataInBuffers_l(portIndex, OMX_FALSE, NULL);
-        return OK;
-    }
-
-    default:
         break;
     }
 
-    CLOG_ERROR(setPortMode, BAD_VALUE, "invalid port mode %d", mode);
-    return BAD_VALUE;
+    default:
+        CLOG_ERROR(setPortMode, BAD_VALUE, "invalid port mode %d", mode);
+        err = BAD_VALUE;
+        break;
+    }
+
+    if (err == OK) {
+        mPortMode[portIndex] = mode;
+    }
+    return err;
 }
 
 status_t OMXNodeInstance::enableNativeBuffers_l(
@@ -843,6 +877,9 @@ status_t OMXNodeInstance::enableNativeBuffers_l(
 status_t OMXNodeInstance::getGraphicBufferUsage(
         OMX_U32 portIndex, OMX_U32* usage) {
     Mutex::Autolock autoLock(mLock);
+    if (mHandle == NULL) {
+        return DEAD_OBJECT;
+    }
 
     OMX_INDEXTYPE index;
     OMX_STRING name = const_cast<OMX_STRING>(
@@ -956,6 +993,10 @@ status_t OMXNodeInstance::prepareForAdaptivePlayback(
         OMX_U32 portIndex, OMX_BOOL enable, OMX_U32 maxFrameWidth,
         OMX_U32 maxFrameHeight) {
     Mutex::Autolock autolock(mLock);
+    if (mHandle == NULL) {
+        return DEAD_OBJECT;
+    }
+
     if (mSailed) {
         android_errorWriteLog(0x534e4554, "29422020");
         return INVALID_OPERATION;
@@ -996,6 +1037,10 @@ status_t OMXNodeInstance::configureVideoTunnelMode(
         OMX_U32 portIndex, OMX_BOOL tunneled, OMX_U32 audioHwSync,
         native_handle_t **sidebandHandle) {
     Mutex::Autolock autolock(mLock);
+    if (mHandle == NULL) {
+        return DEAD_OBJECT;
+    }
+
     if (mSailed) {
         android_errorWriteLog(0x534e4554, "29422020");
         return INVALID_OPERATION;
@@ -1050,6 +1095,10 @@ status_t OMXNodeInstance::useBuffer(
     }
 
     Mutex::Autolock autoLock(mLock);
+    if (mHandle == NULL) {
+        return DEAD_OBJECT;
+    }
+
     if (!mSailed) {
         ALOGE("b/35467458");
         android_errorWriteLog(0x534e4554, "35467458");
@@ -1057,28 +1106,52 @@ status_t OMXNodeInstance::useBuffer(
     }
 
     switch (omxBuffer.mBufferType) {
-        case OMXBuffer::kBufferTypePreset:
+        case OMXBuffer::kBufferTypePreset: {
+            if (mPortMode[portIndex] != IOMX::kPortModeDynamicANWBuffer
+                    && mPortMode[portIndex] != IOMX::kPortModeDynamicNativeHandle) {
+                break;
+            }
             return useBuffer_l(portIndex, NULL, NULL, buffer);
+        }
 
-        case OMXBuffer::kBufferTypeSharedMem:
+        case OMXBuffer::kBufferTypeSharedMem: {
+            if (mPortMode[portIndex] != IOMX::kPortModePresetByteBuffer
+                    && mPortMode[portIndex] != IOMX::kPortModeDynamicANWBuffer) {
+                break;
+            }
             return useBuffer_l(portIndex, omxBuffer.mMem, NULL, buffer);
+        }
 
-        case OMXBuffer::kBufferTypeANWBuffer:
+        case OMXBuffer::kBufferTypeANWBuffer: {
+            if (mPortMode[portIndex] != IOMX::kPortModePresetANWBuffer
+                    && mPortMode[portIndex] != IOMX::kPortModeDynamicANWBuffer) {
+                break;
+            }
             return useGraphicBuffer_l(portIndex, omxBuffer.mGraphicBuffer, buffer);
+        }
 
         case OMXBuffer::kBufferTypeHidlMemory: {
+                if (mPortMode[portIndex] != IOMX::kPortModePresetByteBuffer
+                        && mPortMode[portIndex] != IOMX::kPortModeDynamicANWBuffer
+                        && mPortMode[portIndex] != IOMX::kPortModeDynamicNativeHandle) {
+                    break;
+                }
                 sp<IHidlMemory> hidlMemory = mapMemory(omxBuffer.mHidlMemory);
                 if (hidlMemory == nullptr) {
                     ALOGE("OMXNodeInstance useBuffer() failed to map memory");
                     return NO_MEMORY;
                 }
                 return useBuffer_l(portIndex, NULL, hidlMemory, buffer);
-            }
+        }
         default:
+            return BAD_VALUE;
             break;
     }
 
-    return BAD_VALUE;
+    ALOGE("b/77486542 : bufferType = %d vs. portMode = %d",
+          omxBuffer.mBufferType, mPortMode[portIndex]);
+    android_errorWriteLog(0x534e4554, "77486542");
+    return INVALID_OPERATION;
 }
 
 status_t OMXNodeInstance::useBuffer_l(
@@ -1442,6 +1515,9 @@ status_t OMXNodeInstance::updateNativeHandleInMeta_l(
 status_t OMXNodeInstance::setInputSurface(
         const sp<IOMXBufferSource> &bufferSource) {
     Mutex::Autolock autolock(mLock);
+    if (mHandle == NULL) {
+        return DEAD_OBJECT;
+    }
 
     status_t err;
 
@@ -1508,11 +1584,19 @@ status_t OMXNodeInstance::allocateSecureBuffer(
     }
 
     Mutex::Autolock autoLock(mLock);
+    if (mHandle == NULL) {
+        return DEAD_OBJECT;
+    }
 
     if (!mSailed) {
         ALOGE("b/35467458");
         android_errorWriteLog(0x534e4554, "35467458");
         return BAD_VALUE;
+    }
+    if (mPortMode[portIndex] != IOMX::kPortModePresetSecureBuffer) {
+        ALOGE("b/77486542");
+        android_errorWriteLog(0x534e4554, "77486542");
+        return INVALID_OPERATION;
     }
     BufferMeta *buffer_meta = new BufferMeta(portIndex);
 
@@ -1559,6 +1643,10 @@ status_t OMXNodeInstance::allocateSecureBuffer(
 status_t OMXNodeInstance::freeBuffer(
         OMX_U32 portIndex, IOMX::buffer_id buffer) {
     Mutex::Autolock autoLock(mLock);
+    if (mHandle == NULL) {
+        return DEAD_OBJECT;
+    }
+
     CLOG_BUFFER(freeBuffer, "%s:%u %#x", portString(portIndex), portIndex, buffer);
 
     removeActiveBuffer(portIndex, buffer);
@@ -1583,6 +1671,9 @@ status_t OMXNodeInstance::freeBuffer(
 status_t OMXNodeInstance::fillBuffer(
         IOMX::buffer_id buffer, const OMXBuffer &omxBuffer, int fenceFd) {
     Mutex::Autolock autoLock(mLock);
+    if (mHandle == NULL) {
+        return DEAD_OBJECT;
+    }
 
     OMX_BUFFERHEADERTYPE *header = findBufferHeader(buffer, kPortIndexOutput);
     if (header == NULL) {
@@ -1633,6 +1724,9 @@ status_t OMXNodeInstance::emptyBuffer(
         buffer_id buffer, const OMXBuffer &omxBuffer,
         OMX_U32 flags, OMX_TICKS timestamp, int fenceFd) {
     Mutex::Autolock autoLock(mLock);
+    if (mHandle == NULL) {
+        return DEAD_OBJECT;
+    }
 
     switch (omxBuffer.mBufferType) {
     case OMXBuffer::kBufferTypePreset:
@@ -1843,7 +1937,9 @@ status_t OMXNodeInstance::setMaxPtsGapUs(const void *params, size_t size) {
         return BAD_VALUE;
     }
 
-    mMaxTimestampGapUs = (int64_t)((OMX_PARAM_U32TYPE*)params)->nU32;
+    // The incoming number is an int32_t contained in OMX_U32.
+    // Cast to int32_t first then int64_t.
+    mMaxTimestampGapUs = (int32_t)((OMX_PARAM_U32TYPE*)params)->nU32;
 
     return OK;
 }
@@ -1867,12 +1963,26 @@ int64_t OMXNodeInstance::getCodecTimestamp(OMX_TICKS timestamp) {
         ALOGV("IN  timestamp: %lld -> %lld",
             static_cast<long long>(originalTimeUs),
             static_cast<long long>(timestamp));
+    } else if (mMaxTimestampGapUs < 0ll) {
+        /*
+         * Apply a fixed timestamp gap between adjacent frames.
+         *
+         * This is used by scenarios like still image capture where timestamps
+         * on frames could go forward or backward. Some encoders may silently
+         * drop frames when it goes backward (or even stay unchanged).
+         */
+        if (mPrevOriginalTimeUs >= 0ll) {
+            timestamp = mPrevModifiedTimeUs - mMaxTimestampGapUs;
+        }
+        ALOGV("IN  timestamp: %lld -> %lld",
+            static_cast<long long>(originalTimeUs),
+            static_cast<long long>(timestamp));
     }
 
     mPrevOriginalTimeUs = originalTimeUs;
     mPrevModifiedTimeUs = timestamp;
 
-    if (mMaxTimestampGapUs > 0ll && !mRestorePtsFailed) {
+    if (mMaxTimestampGapUs != 0ll && !mRestorePtsFailed) {
         mOriginalTimeUs.add(timestamp, originalTimeUs);
     }
 
@@ -1905,7 +2015,7 @@ status_t OMXNodeInstance::emptyNativeHandleBuffer_l(
 void OMXNodeInstance::codecBufferFilled(omx_message &msg) {
     Mutex::Autolock autoLock(mLock);
 
-    if (mMaxTimestampGapUs <= 0ll || mRestorePtsFailed) {
+    if (mMaxTimestampGapUs == 0ll || mRestorePtsFailed) {
         return;
     }
 
@@ -1931,6 +2041,9 @@ void OMXNodeInstance::codecBufferFilled(omx_message &msg) {
 status_t OMXNodeInstance::getExtensionIndex(
         const char *parameterName, OMX_INDEXTYPE *index) {
     Mutex::Autolock autoLock(mLock);
+    if (mHandle == NULL) {
+        return DEAD_OBJECT;
+    }
 
     OMX_ERRORTYPE err = OMX_GetExtensionIndex(
             mHandle, const_cast<char *>(parameterName), index);

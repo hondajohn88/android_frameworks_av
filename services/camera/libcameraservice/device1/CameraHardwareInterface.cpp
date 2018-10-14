@@ -140,14 +140,19 @@ hardware::Return<void> CameraHardwareInterface::dataCallback(
 hardware::Return<void> CameraHardwareInterface::QDataCallback(
         DataCallbackMsg msgType, uint32_t data, uint32_t bufferIndex,
         const vendor::qti::hardware::camera::device::V1_0::QCameraFrameMetadata& metadata) {
-    if (mHidlMemPoolMap.count(data) == 0) {
-        ALOGE("%s: memory pool ID %d not found", __FUNCTION__, data);
-        return hardware::Void();
+    camera_memory_t* mem = nullptr;
+    {
+        std::lock_guard<std::mutex> lock(mHidlMemPoolMapLock);
+        if (mHidlMemPoolMap.count(data) == 0) {
+            ALOGE("%s: memory pool ID %d not found", __FUNCTION__, data);
+            return hardware::Void();
+        }
+        mem = mHidlMemPoolMap.at(data);
     }
     camera_frame_metadata_t md;
     md.number_of_faces = metadata.faces.size();
     md.faces = (camera_face_t*) metadata.faces.data();
-    sDataCb((int32_t) msgType, mHidlMemPoolMap.at(data), bufferIndex, &md, this);
+    sDataCb((int32_t) msgType, mem, bufferIndex, &md, this);
     return hardware::Void();
 }
 #endif
@@ -595,12 +600,16 @@ void CameraHardwareInterface::releaseRecordingFrame(const sp<IMemory>& mem)
     if (CC_LIKELY(mHidlDevice != nullptr)) {
         if (size == sizeof(VideoNativeHandleMetadata)) {
             VideoNativeHandleMetadata* md = (VideoNativeHandleMetadata*) mem->pointer();
-            // Caching the handle here because md->pHandle will be subject to HAL's edit
-            native_handle_t* nh = md->pHandle;
-            hidl_handle frame = nh;
-            mHidlDevice->releaseRecordingFrameHandle(heapId, bufferIndex, frame);
-            native_handle_close(nh);
-            native_handle_delete(nh);
+            if (md->eType == kMetadataBufferTypeNativeHandleSource) {
+                // Caching the handle here because md->pHandle will be subject to HAL's edit
+                native_handle_t* nh = md->pHandle;
+                hidl_handle frame = nh;
+                mHidlDevice->releaseRecordingFrameHandle(heapId, bufferIndex, frame);
+                native_handle_close(nh);
+                native_handle_delete(nh);
+            } else {
+                mHidlDevice->releaseRecordingFrame(heapId, bufferIndex);
+            }
         } else {
             mHidlDevice->releaseRecordingFrame(heapId, bufferIndex);
         }

@@ -211,6 +211,6 @@ private:
     AudioPolicyService *mAudioPolicyService;
 };
 
-}; // namespace android
+} // namespace android
 
 #endif // ANDROID_AUDIOPOLICYEFFECTS_H
